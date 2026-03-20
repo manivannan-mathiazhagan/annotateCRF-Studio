@@ -67,6 +67,13 @@ import fitz
 # ================================
 # Settings
 # ================================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+APP_ICON_CANDIDATES = [
+    os.path.join(SCRIPT_DIR, "annotator_icon.ico"),
+    os.path.join(SCRIPT_DIR, "annotator_icon.png"),
+]
+
 DEFAULT_ZOOM = 1.30
 
 DOMAIN_COLORS = [
@@ -91,7 +98,10 @@ TEXT_PADDING_X = 3.0
 TEXT_PADDING_Y = 1.5
 BOX_HEIGHT_NORMAL = 15.0
 BOX_HEIGHT_DOMAIN = 18.0
-MAX_WRAP_WIDTH = 240.0
+
+MAX_WRAP_WIDTH = 420.0
+RIGHT_PAGE_MARGIN = 18.0
+MIN_BOX_WIDTH = 60.0
 
 BOOKMARK_PREVIEW_COLOR = QtGui.QColor("#7c3aed")
 BOOKMARK_PREVIEW_TEXT_COLOR = QtGui.QColor("#5b21b6")
@@ -162,7 +172,7 @@ def get_domain_color_map(entries) -> dict:
     return color_map
 
 
-def compute_entry_layout(entry, color_map):
+def compute_entry_layout(entry, color_map, page_width=None):
     domain_key = (entry.domain or "").strip().upper()
 
     fill = NOTSUB_FILL if entry.is_not_submitted else color_map.get(domain_key, DEFAULT_OTHER_FILL)
@@ -174,10 +184,20 @@ def compute_entry_layout(entry, color_map):
 
     text = (entry.annotation or "").strip()
     raw_w = estimate_text_width(text, scale=scale)
-    wrap_width = MAX_WRAP_WIDTH if raw_w > MAX_WRAP_WIDTH else raw_w
+
+    allowed_width = MAX_WRAP_WIDTH
+    if page_width is not None:
+        available = max(MIN_BOX_WIDTH, page_width - entry.x1 - RIGHT_PAGE_MARGIN)
+        allowed_width = min(MAX_WRAP_WIDTH, available)
+
+    wrap_width = allowed_width if raw_w > allowed_width else raw_w
+    wrap_width = max(MIN_BOX_WIDTH, wrap_width)
+
     lines = wrap_text_by_width(text, wrap_width, scale=scale)
     actual_w = max(estimate_text_width(line, scale=scale) for line in lines) if lines else raw_w
-    box_w = min(MAX_WRAP_WIDTH, actual_w)
+    box_w = min(allowed_width, actual_w)
+    box_w = max(MIN_BOX_WIDTH, box_w)
+
     box_h = max(base_h, len(lines) * (font_size + 1.2) + 4)
 
     return {
@@ -537,7 +557,8 @@ class PdfLabel(QtWidgets.QLabel):
         self.dragging = False
 
     def _get_entry_rect_on_screen(self, entry, color_map):
-        layout = compute_entry_layout(entry, color_map)
+        page_width = self.main_window.page_rect.width if self.main_window.page_rect else None
+        layout = compute_entry_layout(entry, color_map, page_width=page_width)
         rect_pdf = rect_from_top_origin(entry.x1, entry.y1, layout["box_w"], layout["box_h"], entry.pageh)
         zoom = self.main_window.zoom
         return QtCore.QRectF(
@@ -555,7 +576,6 @@ class PdfLabel(QtWidgets.QLabel):
             current_page = self.main_window.current_page_index + 1
             color_map = get_domain_color_map(self.main_window.entries)
 
-            # drag existing annotation only in annotation mode
             if self.main_window.active_mode == "annotation":
                 for idx in reversed(range(len(self.main_window.entries))):
                     entry = self.main_window.entries[idx]
@@ -609,13 +629,14 @@ class PdfLabel(QtWidgets.QLabel):
         zoom = self.main_window.zoom
         current_page = self.main_window.current_page_index + 1
         color_map = get_domain_color_map(self.main_window.entries)
+        page_width = self.main_window.page_rect.width if self.main_window.page_rect else None
 
         # Annotation previews
         for idx, entry in enumerate(self.main_window.entries):
             if entry.pageno != current_page:
                 continue
 
-            layout = compute_entry_layout(entry, color_map)
+            layout = compute_entry_layout(entry, color_map, page_width=page_width)
             rect_pdf = rect_from_top_origin(entry.x1, entry.y1, layout["box_w"], layout["box_h"], entry.pageh)
             rect = QtCore.QRectF(
                 rect_pdf.x0 * zoom,
@@ -709,6 +730,8 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.setMinimumSize(1100, 760)
         self.setStyleSheet("background-color: #f3f7fd;")
 
+        self.apply_app_icon()
+
         self.doc = None
         self.open_pdf_path = ""
         self.current_page_index = 0
@@ -736,6 +759,16 @@ class AnnotatorApp(QtWidgets.QWidget):
 
         self.build_ui()
 
+    def apply_app_icon(self):
+        for icon_path in APP_ICON_CANDIDATES:
+            if os.path.exists(icon_path):
+                icon = QtGui.QIcon(icon_path)
+                self.setWindowIcon(icon)
+                app = QtWidgets.QApplication.instance()
+                if app is not None:
+                    app.setWindowIcon(icon)
+                break
+
     def build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 8)
@@ -758,6 +791,25 @@ class AnnotatorApp(QtWidgets.QWidget):
         sub.setWordWrap(True)
         sub.setStyleSheet("QLabel { color: #21466d; padding: 0 0 4px 0; font-family: 'Times New Roman'; font-size: 12pt; }")
         layout.addWidget(sub)
+
+        contact_note = QtWidgets.QLabel(
+            "For suggestions / any changes / issue faced contact manivannan.mathialagan@veristat.com"
+        )
+        contact_note.setAlignment(QtCore.Qt.AlignCenter)
+        contact_note.setWordWrap(True)
+        contact_note.setStyleSheet("""
+            QLabel {
+                background: #eef6ff;
+                color: #184a78;
+                border: 1px solid #c8dff6;
+                border-radius: 10px;
+                padding: 6px 10px;
+                font-family: 'Times New Roman';
+                font-size: 11pt;
+                font-style: italic;
+            }
+        """)
+        layout.addWidget(contact_note)
 
         # Mode row
         mode_row = QtWidgets.QHBoxLayout()
@@ -1387,7 +1439,7 @@ class AnnotatorApp(QtWidgets.QWidget):
                         continue
 
                     page = doc[e.pageno - 1]
-                    layout = compute_entry_layout(e, color_map)
+                    layout = compute_entry_layout(e, color_map, page_width=page.rect.width)
                     rect = rect_from_top_origin(e.x1, e.y1, layout["box_w"], layout["box_h"], e.pageh)
 
                     if rect.x1 > page.rect.width:
