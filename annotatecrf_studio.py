@@ -1,27 +1,27 @@
 # ====================================================================================================
-# Script Name    : Annotator_Studio_DirectPDF_Bookmarks.py
+# Script Name    : annotatecrf_studio.py
 #
 # Description    :
 #                  Desktop GUI utility for capturing annotation positions from a PDF and generating
 #                  final visible comment boxes directly into a PDF without XFDF / Adobe dependency.
 #
-#                  Behavior:
-#                    - Top mode selector: Annotation / Bookmark
+#                  Workflow:
+#                    - Open PDF first
 #                    - Annotation mode:
 #                        * Click on PDF -> enter details -> preview box appears immediately
 #                        * Drag an existing preview box to move it
+#                        * Manage annotation rows + export/load CSV
 #                    - Bookmark mode:
-#                        * Add Bookmark button opens bookmark dialog
-#                        * Bookmark dialog asks only Bookmark Text, Level, Page No
-#                    - Generate Final Output PDF:
-#                        * annotations only, if only annotations exist
-#                        * bookmarks only, if only bookmarks exist
-#                        * both, if both exist
+#                        * Click on PDF -> enter bookmark details for current page
+#                        * Manage bookmark rows + export/load CSV
+#                    - Review mode:
+#                        * View annotation and bookmark tables side by side
+#                        * Generate Final Output PDF
 #
-#                  Annotation CSV columns:
+#                  Annotation CSV columns used internally:
 #                    DOMAIN,NAME,PAGENO,ANNOTATION,ASSIGNEDFIELD,X1,Y1,PAGEH
 #
-#                  Bookmark CSV columns:
+#                  Bookmark CSV columns used internally:
 #                    TITLE,LEVEL,PAGENO
 # ====================================================================================================
 
@@ -75,13 +75,12 @@ APP_ICON_CANDIDATES = [
 ]
 
 DEFAULT_ZOOM = 1.30
-
 DOMAIN_COLORS = [
-    (0.75, 1.00, 1.00),   # cyan
-    (0.59, 1.00, 0.59),   # green
-    (1.00, 0.75, 0.61),   # peach
-    (1.00, 0.80, 0.55),   # orange
-    (0.86, 0.82, 1.00),   # lavender
+    (0.75, 1.00, 1.00),   # 1st domain on page = cyan
+    (0.59, 1.00, 0.59),   # 2nd domain on page = green
+    (1.00, 0.75, 0.61),   # 3rd domain on page = peach
+    (1.00, 0.80, 0.55),   # 4th domain on page = orange
+    (0.86, 0.82, 1.00),   # 5th domain on page = lavender
 ]
 DEFAULT_OTHER_FILL = (0.85, 0.85, 0.85)
 NOTSUB_FILL = (1.00, 0.93, 0.55)
@@ -99,12 +98,17 @@ TEXT_PADDING_Y = 1.5
 BOX_HEIGHT_NORMAL = 15.0
 BOX_HEIGHT_DOMAIN = 18.0
 
-MAX_WRAP_WIDTH = 420.0
-RIGHT_PAGE_MARGIN = 18.0
-MIN_BOX_WIDTH = 60.0
+MAX_WRAP_WIDTH = 520.0
+RIGHT_PAGE_MARGIN = 12.0
+MIN_BOX_WIDTH = 90.0
+LONG_TEXT_THRESHOLD = 22
+LONG_TEXT_MIN_WIDTH = 220.0
 
 BOOKMARK_PREVIEW_COLOR = QtGui.QColor("#7c3aed")
 BOOKMARK_PREVIEW_TEXT_COLOR = QtGui.QColor("#5b21b6")
+
+ANNOTATION_CSV_COLUMNS = ["DOMAIN", "NAME", "PAGENO", "ANNOTATION", "ASSIGNEDFIELD", "X1", "Y1", "PAGEH"]
+BOOKMARK_CSV_COLUMNS = ["TITLE", "LEVEL", "PAGENO"]
 
 CHAR_WIDTHS = {
     '!': 3.43, '"': 4.82, '#': 5.65, '$': 5.65, '%': 8.99, "'": 2.47,
@@ -159,16 +163,23 @@ def rect_from_top_origin(x1: float, y1_top: float, width: float, height: float, 
     return fitz.Rect(x1, y1_top, x1 + width, y1_top + height)
 
 
-def get_domain_color_map(entries) -> dict:
+def get_page_domain_color_map(entries, pageno: int) -> dict:
     ordered_domains = OrderedDict()
     for e in entries:
+        if e.pageno != pageno:
+            continue
         dom = (e.domain or "").strip().upper()
-        if dom and dom != "NOTSUB" and dom not in ordered_domains:
+        if not dom or dom == "NOTSUB":
+            continue
+        if dom not in ordered_domains:
             ordered_domains[dom] = None
 
     color_map = {}
-    for i, dom in enumerate(ordered_domains.keys(), start=1):
-        color_map[dom] = DOMAIN_COLORS[i - 1] if i <= len(DOMAIN_COLORS) else DEFAULT_OTHER_FILL
+    for i, dom in enumerate(ordered_domains.keys()):
+        if i < len(DOMAIN_COLORS):
+            color_map[dom] = DOMAIN_COLORS[i]
+        else:
+            color_map[dom] = DEFAULT_OTHER_FILL
     return color_map
 
 
@@ -190,12 +201,22 @@ def compute_entry_layout(entry, color_map, page_width=None):
         available = max(MIN_BOX_WIDTH, page_width - entry.x1 - RIGHT_PAGE_MARGIN)
         allowed_width = min(MAX_WRAP_WIDTH, available)
 
-    wrap_width = allowed_width if raw_w > allowed_width else raw_w
-    wrap_width = max(MIN_BOX_WIDTH, wrap_width)
+    preferred_width = raw_w
 
-    lines = wrap_text_by_width(text, wrap_width, scale=scale)
+    long_text = (
+        len(text) >= LONG_TEXT_THRESHOLD
+        or " when " in f" {text.lower()} "
+        or "/" in text
+    )
+    if long_text:
+        preferred_width = max(preferred_width, LONG_TEXT_MIN_WIDTH)
+
+    box_w = min(allowed_width, preferred_width)
+    box_w = max(MIN_BOX_WIDTH, box_w)
+
+    lines = wrap_text_by_width(text, box_w, scale=scale)
     actual_w = max(estimate_text_width(line, scale=scale) for line in lines) if lines else raw_w
-    box_w = min(allowed_width, actual_w)
+    box_w = min(allowed_width, max(box_w, actual_w))
     box_w = max(MIN_BOX_WIDTH, box_w)
 
     box_h = max(base_h, len(lines) * (font_size + 1.2) + 4)
@@ -249,8 +270,20 @@ def draw_box_and_text_pdf(page, rect, text_lines, fill_color, bold=False, dashed
 
 
 def sanitize_output_pdf_path(src_pdf: str):
-    base, ext = os.path.splitext(src_pdf)
+    base, _ = os.path.splitext(src_pdf)
     return base + "_final.pdf"
+
+
+def bool_from_entry(domain, name, annotation, assignedfield):
+    d = (domain or "").strip().upper()
+    n = (name or "").strip().upper()
+    a = (annotation or "").strip().upper()
+    assigned = (assignedfield or "").strip().upper()
+
+    is_not_submitted = (d == "NOTSUB") or (n == "NOTSUB") or (a == "[NOT SUBMITTED]")
+    is_domain_annotation = (not is_not_submitted) and not str(name).strip()
+    is_assigned_field = assigned == "Y"
+    return is_domain_annotation, is_assigned_field, is_not_submitted
 
 
 # ================================
@@ -569,34 +602,38 @@ class PdfLabel(QtWidgets.QLabel):
         )
 
     def mousePressEvent(self, event):
-        if not self.main_window or self.main_window.page_pixmap is None:
+        if not self.main_window or not self.main_window.pdf_loaded or self.main_window.page_pixmap is None:
             return
 
-        if event.button() == QtCore.Qt.LeftButton:
-            current_page = self.main_window.current_page_index + 1
-            color_map = get_domain_color_map(self.main_window.entries)
+        if event.button() != QtCore.Qt.LeftButton:
+            return
 
-            if self.main_window.active_mode == "annotation":
-                for idx in reversed(range(len(self.main_window.entries))):
-                    entry = self.main_window.entries[idx]
-                    if entry.pageno != current_page:
-                        continue
-                    rect = self._get_entry_rect_on_screen(entry, color_map)
-                    if rect.contains(event.pos()):
-                        self.drag_entry_index = idx
-                        self.dragging = True
-                        self.drag_offset = QtCore.QPointF(event.pos()) - rect.topLeft()
-                        self.main_window.selected_entry_index = idx
-                        self.main_window.refresh_selection_only()
-                        self.update()
-                        return
+        current_page = self.main_window.current_page_index + 1
+        color_map = get_page_domain_color_map(self.main_window.entries, current_page)
 
-            self.last_click_point = event.pos()
-            self.main_window.store_last_click(event.pos())
-            self.update()
+        if self.main_window.active_mode == "annotation":
+            for idx in reversed(range(len(self.main_window.entries))):
+                entry = self.main_window.entries[idx]
+                if entry.pageno != current_page:
+                    continue
+                rect = self._get_entry_rect_on_screen(entry, color_map)
+                if rect.contains(event.pos()):
+                    self.drag_entry_index = idx
+                    self.dragging = True
+                    self.drag_offset = QtCore.QPointF(event.pos()) - rect.topLeft()
+                    self.main_window.selected_entry_index = idx
+                    self.main_window.refresh_selection_only()
+                    self.update()
+                    return
 
-            if self.main_window.active_mode == "annotation":
-                self.main_window.capture_annotation_point(event.pos())
+        self.last_click_point = event.pos()
+        self.main_window.store_last_click(event.pos())
+        self.update()
+
+        if self.main_window.active_mode == "annotation":
+            self.main_window.capture_annotation_point(event.pos())
+        elif self.main_window.active_mode == "bookmark":
+            self.main_window.capture_bookmark_point()
 
     def mouseMoveEvent(self, event):
         if not self.main_window or self.drag_entry_index is None or not self.dragging:
@@ -622,13 +659,13 @@ class PdfLabel(QtWidgets.QLabel):
     def paintEvent(self, event):
         super().paintEvent(event)
 
-        if not self.main_window:
+        if not self.main_window or self.main_window.page_rect is None:
             return
 
         painter = QtGui.QPainter(self)
         zoom = self.main_window.zoom
         current_page = self.main_window.current_page_index + 1
-        color_map = get_domain_color_map(self.main_window.entries)
+        color_map = get_page_domain_color_map(self.main_window.entries, current_page)
         page_width = self.main_window.page_rect.width if self.main_window.page_rect else None
 
         # Annotation previews
@@ -671,7 +708,7 @@ class PdfLabel(QtWidgets.QLabel):
 
             mx = entry.x1 * zoom
             my = entry.y1 * zoom
-            if idx == self.main_window.selected_entry_index and self.main_window.tabs.currentIndex() == 0:
+            if idx == self.main_window.selected_entry_index:
                 sel_pen = QtGui.QPen(QtGui.QColor("#ff00aa"), 3)
                 painter.setPen(sel_pen)
                 painter.drawEllipse(QtCore.QPointF(mx, my), 6, 6)
@@ -692,14 +729,13 @@ class PdfLabel(QtWidgets.QLabel):
 
         for idx, bm in enumerate(page_bookmarks):
             sy = y_base + idx * y_gap
-            painter.drawLine(0, sy, min(self.width(), 260), sy)
+            painter.drawLine(0, sy, min(self.width(), 320), sy)
 
             text_pen = QtGui.QPen(BOOKMARK_PREVIEW_TEXT_COLOR, 1)
             painter.setPen(text_pen)
             f = QtGui.QFont("Arial", 9)
             is_selected = (
-                self.main_window.tabs.currentIndex() == 1
-                and 0 <= self.main_window.selected_bookmark_index < len(self.main_window.bookmarks)
+                0 <= self.main_window.selected_bookmark_index < len(self.main_window.bookmarks)
                 and self.main_window.bookmarks[self.main_window.selected_bookmark_index] == bm
             )
             f.setBold(is_selected)
@@ -710,7 +746,7 @@ class PdfLabel(QtWidgets.QLabel):
             painter.setPen(bookmark_pen)
 
         # Last click crosshair
-        if self.last_click_point:
+        if self.last_click_point and self.main_window.active_mode in ("annotation", "bookmark"):
             pen = QtGui.QPen(QtGui.QColor("#ff3b30"), 2)
             painter.setPen(pen)
             x = self.last_click_point.x()
@@ -725,7 +761,7 @@ class PdfLabel(QtWidgets.QLabel):
 class AnnotatorApp(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Annotator Studio - Direct PDF")
+        self.setWindowTitle("Annotated CRF Studio")
         self.resize(1280, 900)
         self.setMinimumSize(1100, 760)
         self.setStyleSheet("background-color: #f3f7fd;")
@@ -745,17 +781,17 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.selected_entry_index = -1
         self.selected_bookmark_index = -1
 
-        self.current_annotation_csv_path = ""
-        self.current_bookmark_csv_path = ""
-
-        self._suppress_annotation_selection_signal = False
-        self._suppress_bookmark_selection_signal = False
-
         self.last_click_pdf_x = None
         self.last_click_pdf_y = None
         self.last_click_pageh = None
 
         self.active_mode = "annotation"
+        self.pdf_loaded = False
+        self.has_annotation = False
+        self.has_bookmark = False
+
+        self._suppress_annotation_selection_signal = False
+        self._suppress_bookmark_selection_signal = False
 
         self.build_ui()
 
@@ -774,7 +810,7 @@ class AnnotatorApp(QtWidgets.QWidget):
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(8)
 
-        header = QtWidgets.QLabel("Annotator Studio")
+        header = QtWidgets.QLabel("Annotated CRF Studio")
         header.setAlignment(QtCore.Qt.AlignCenter)
         header.setStyleSheet("""
             QLabel {
@@ -784,24 +820,24 @@ class AnnotatorApp(QtWidgets.QWidget):
         """)
         layout.addWidget(header)
 
-        sub = QtWidgets.QLabel(
-            "Choose mode at top. Annotation mode allows PDF click capture. Bookmark mode adds page-level bookmarks."
+        subtitle = QtWidgets.QLabel(
+            "One-Click Annotation & Bookmarking for MSG 2.0–Compliant aCRFs"
         )
-        sub.setAlignment(QtCore.Qt.AlignCenter)
-        sub.setWordWrap(True)
-        sub.setStyleSheet("QLabel { color: #21466d; padding: 0 0 4px 0; font-family: 'Times New Roman'; font-size: 12pt; }")
-        layout.addWidget(sub)
+        subtitle.setAlignment(QtCore.Qt.AlignCenter)
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("QLabel { color: #21466d; padding: 0 0 4px 0; font-family: 'Times New Roman'; font-size: 12pt; }")
+        layout.addWidget(subtitle)
 
         contact_note = QtWidgets.QLabel(
-            "For suggestions / any changes / issue faced contact manivannan.mathialagan@veristat.com"
+            "For queries / suggestions / issues: Manivannan.Mathialagan@veristat.com"
         )
         contact_note.setAlignment(QtCore.Qt.AlignCenter)
         contact_note.setWordWrap(True)
         contact_note.setStyleSheet("""
             QLabel {
-                background: #eef6ff;
+                background: #fff3c9;
                 color: #184a78;
-                border: 1px solid #c8dff6;
+                border: 1px solid #e6d27d;
                 border-radius: 10px;
                 padding: 6px 10px;
                 font-family: 'Times New Roman';
@@ -811,76 +847,35 @@ class AnnotatorApp(QtWidgets.QWidget):
         """)
         layout.addWidget(contact_note)
 
-        # Mode row
-        mode_row = QtWidgets.QHBoxLayout()
-        mode_row.setSpacing(10)
-
-        mode_lbl = QtWidgets.QLabel("Selection")
-        mode_lbl.setStyleSheet("""
-            QLabel {
-                font-family: 'Times New Roman';
-                font-size: 12pt;
-                font-weight: bold;
-                color: #153b68;
-            }
-        """)
-
-        self.mode_combo = QtWidgets.QComboBox()
-        self.mode_combo.addItems(["Annotation", "Bookmark"])
-        self.mode_combo.setFixedWidth(180)
-        self.mode_combo.setStyleSheet("""
-            QComboBox {
-                background: white;
-                border: 1px solid #a8bfdc;
-                border-radius: 8px;
-                padding: 6px 10px;
-                font-family: 'Times New Roman';
-                font-size: 12pt;
-            }
-        """)
-
-        mode_row.addStretch()
-        mode_row.addWidget(mode_lbl)
-        mode_row.addWidget(self.mode_combo)
-        mode_row.addStretch()
-        layout.addLayout(mode_row)
-
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_row.setSpacing(8)
-
         btn_base = """
             QPushButton {
                 font-family: 'Times New Roman'; font-weight: bold; font-size: 11pt;
                 border-radius: 10px; padding: 6px 14px; min-height: 34px;
             }
+            QPushButton:disabled {
+                background-color: #d9d9d9;
+                color: #7a7a7a;
+            }
         """
 
         def mkbtn(text, bg, hov, fg="white"):
             b = QtWidgets.QPushButton(text)
-            b.setStyleSheet(btn_base + f"QPushButton {{ background-color: {bg}; color: {fg}; }} QPushButton:hover {{ background-color: {hov}; }}")
+            b.setStyleSheet(btn_base + f"""
+                QPushButton {{ background-color: {bg}; color: {fg}; }}
+                QPushButton:hover:!disabled {{ background-color: {hov}; }}
+            """)
             return b
 
-        self.btn_open = mkbtn("Open PDF", "#b3c6e7", "#d5deef", "#222")
-        self.btn_prev = mkbtn("Previous", "#ad7dfc", "#c7a2fd")
-        self.btn_next = mkbtn("Next", "#ad7dfc", "#c7a2fd")
-        self.btn_add_bookmark = mkbtn("Add Bookmark", "#8b5cf6", "#a78bfa")
-        self.btn_delete = mkbtn("Delete Selected Row", "#f16a6a", "#f48f8f")
-        self.btn_save_ann_csv = mkbtn("Export Annotation CSV", "#71c95e", "#98eb84")
-        self.btn_load_ann_csv = mkbtn("Load Annotation CSV", "#5bb7a6", "#7ed2c2")
-        self.btn_save_bm_csv = mkbtn("Export Bookmark CSV", "#71c95e", "#98eb84")
-        self.btn_load_bm_csv = mkbtn("Load Bookmark CSV", "#5bb7a6", "#7ed2c2")
-        self.btn_generate_pdf = mkbtn("Generate Final Output PDF", "#ff9933", "#ffbc80", "#222")
+        # Top controls
+        top_row = QtWidgets.QHBoxLayout()
+        top_row.setSpacing(8)
 
-        for b in [
-            self.btn_open, self.btn_prev, self.btn_next,
-            self.btn_add_bookmark, self.btn_delete,
-            self.btn_save_ann_csv, self.btn_load_ann_csv,
-            self.btn_save_bm_csv, self.btn_load_bm_csv,
-            self.btn_generate_pdf
-        ]:
-            btn_row.addWidget(b)
+        self.btn_open = mkbtn("Open PDF", "#3b82f6", "#5c9cff")
+        self.btn_prev = mkbtn("Previous Page", "#b9b9b9", "#d0d0d0", "#333")
+        self.btn_next = mkbtn("Next Page", "#ad7dfc", "#c7a2fd")
 
-        btn_row.addStretch()
+        self.btn_prev.setEnabled(False)
+        self.btn_next.setEnabled(False)
 
         self.page_info = QtWidgets.QLabel("Page: -")
         self.page_info.setStyleSheet("""
@@ -889,18 +884,61 @@ class AnnotatorApp(QtWidgets.QWidget):
                 font-family: 'Times New Roman'; font-size: 11pt; font-weight: bold;
             }
         """)
-        btn_row.addWidget(self.page_info)
-        layout.addLayout(btn_row)
+
+        top_row.addWidget(self.btn_open)
+        top_row.addWidget(self.btn_prev)
+        top_row.addWidget(self.btn_next)
+        top_row.addStretch()
+        top_row.addWidget(self.page_info)
+        layout.addLayout(top_row)
+
+        # Mode row
+        mode_row = QtWidgets.QHBoxLayout()
+        mode_row.setSpacing(8)
+
+        self.btn_annotation = mkbtn("Annotation", "#2563eb", "#4a7df2")
+        self.btn_bookmark = mkbtn("Bookmark", "#7c3aed", "#9b63f0")
+        self.btn_review = mkbtn("Review", "#059669", "#21b58a")
+
+        self.btn_annotation.setEnabled(False)
+        self.btn_bookmark.setEnabled(False)
+        self.btn_review.setEnabled(False)
+
+        mode_row.addWidget(self.btn_annotation)
+        mode_row.addWidget(self.btn_bookmark)
+        mode_row.addWidget(self.btn_review)
+        layout.addLayout(mode_row)
+
+        # Main stack:
+        # 0 = normal view (PDF + mode tools below)
+        # 1 = review only (no PDF)
+        self.main_stack = QtWidgets.QStackedWidget()
+        layout.addWidget(self.main_stack, 1)
+
+        # ------------------------------------------------------------------
+        # PAGE 0: NORMAL VIEW
+        # ------------------------------------------------------------------
+        normal_page = QtWidgets.QWidget()
+        normal_layout = QtWidgets.QVBoxLayout(normal_page)
+        normal_layout.setContentsMargins(0, 0, 0, 0)
+        normal_layout.setSpacing(8)
 
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         self.splitter.setChildrenCollapsible(False)
         self.splitter.setHandleWidth(10)
-        self.splitter.setStretchFactor(0, 8)
-        self.splitter.setStretchFactor(1, 2)
 
-        pdf_widget = QtWidgets.QWidget()
-        pdf_layout = QtWidgets.QVBoxLayout(pdf_widget)
+        # PDF block
+        self.pdf_widget = QtWidgets.QWidget()
+        pdf_layout = QtWidgets.QVBoxLayout(self.pdf_widget)
         pdf_layout.setContentsMargins(0, 0, 0, 0)
+        pdf_layout.setSpacing(4)
+
+        self.tip = QtWidgets.QLabel(
+            "Click anywhere on the PDF to add annotation or bookmark, based on the selected mode."
+        )
+        self.tip.setWordWrap(True)
+        self.tip.setStyleSheet("QLabel { background: #eef6ff; color: #35516e; border-radius: 8px; padding: 5px 10px; font-family: 'Times New Roman'; font-size: 11pt; }")
+        pdf_layout.addWidget(self.tip)
 
         self.image_label = PdfLabel()
         self.image_label.main_window = self
@@ -914,33 +952,23 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.pdf_scroll.setStyleSheet("QScrollArea { border: 1px solid #b8c2d0; border-radius: 12px; background: #eef4fb; }")
         pdf_layout.addWidget(self.pdf_scroll)
 
-        bottom_widget = QtWidgets.QWidget()
-        bottom_layout = QtWidgets.QVBoxLayout(bottom_widget)
-        bottom_layout.setContentsMargins(0, 0, 0, 0)
-        bottom_layout.setSpacing(6)
+        self.splitter.addWidget(self.pdf_widget)
 
-        tip = QtWidgets.QLabel(
-            "Blue = saved annotation points on current page | Magenta = selected annotation point | "
-            "Purple dashed lines = page bookmarks preview | Red = latest click"
-        )
-        tip.setWordWrap(True)
-        tip.setStyleSheet("QLabel { background: #fff3c9; color: #8a5b00; border-radius: 8px; padding: 5px 10px; font-family: 'Times New Roman'; font-size: 11pt; }")
-        bottom_layout.addWidget(tip)
+        # Bottom stack
+        self.bottom_stack = QtWidgets.QStackedWidget()
 
-        self.tabs = QtWidgets.QTabWidget()
-        self.tabs.setStyleSheet("""
-            QTabWidget::pane { border: 1px solid #b8c2d0; border-radius: 10px; background: white; }
-            QTabBar::tab {
-                font-family: 'Times New Roman'; font-size: 11pt; padding: 8px 16px;
-                background: #dde8f6; border-top-left-radius: 8px; border-top-right-radius: 8px; margin-right: 4px;
-            }
-            QTabBar::tab:selected { background: #ffffff; font-weight: bold; }
-        """)
+        # ==========================
+        # Annotation page
+        # ==========================
+        ann_page = QtWidgets.QWidget()
+        ann_layout = QtWidgets.QVBoxLayout(ann_page)
+        ann_layout.setContentsMargins(0, 0, 0, 0)
+        ann_layout.setSpacing(6)
 
-        # Annotation tab
-        ann_tab = QtWidgets.QWidget()
-        ann_layout = QtWidgets.QVBoxLayout(ann_tab)
-        ann_layout.setContentsMargins(6, 6, 6, 6)
+        ann_hdr = QtWidgets.QLabel("Annotations")
+        ann_hdr.setAlignment(QtCore.Qt.AlignCenter)
+        ann_hdr.setStyleSheet("QLabel { background: #dbeafe; color: #1e3a8a; border-radius: 8px; padding: 5px; font-weight: bold; }")
+        ann_layout.addWidget(ann_hdr)
 
         self.annotation_table = QtWidgets.QTableWidget(0, 5)
         self.annotation_table.setHorizontalHeaderLabels(["DOMAIN", "NAME", "PAGENO", "ANNOTATION", "ASSIGNED\nFIELD"])
@@ -959,18 +987,39 @@ class AnnotatorApp(QtWidgets.QWidget):
         ann_header_view.setSectionResizeMode(2, QtWidgets.QHeaderView.Fixed)
         ann_header_view.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
         ann_header_view.setSectionResizeMode(4, QtWidgets.QHeaderView.Fixed)
-
         self.annotation_table.setColumnWidth(0, 110)
         self.annotation_table.setColumnWidth(1, 140)
         self.annotation_table.setColumnWidth(2, 80)
         self.annotation_table.setColumnWidth(4, 110)
-
         ann_layout.addWidget(self.annotation_table)
 
-        # Bookmark tab
-        bm_tab = QtWidgets.QWidget()
-        bm_layout = QtWidgets.QVBoxLayout(bm_tab)
-        bm_layout.setContentsMargins(6, 6, 6, 6)
+        ann_btn_row = QtWidgets.QHBoxLayout()
+        ann_btn_row.setSpacing(8)
+
+        self.btn_export_ann = mkbtn("Export Annotation CSV", "#2563eb", "#4a7df2")
+        self.btn_load_ann = mkbtn("Load Annotation CSV", "#7c3aed", "#9b63f0")
+        self.btn_delete_ann = mkbtn("Delete Selected Annotation", "#ef4444", "#f87171")
+
+        ann_btn_row.addWidget(self.btn_export_ann)
+        ann_btn_row.addWidget(self.btn_load_ann)
+        ann_btn_row.addStretch()
+        ann_btn_row.addWidget(self.btn_delete_ann)
+
+        ann_layout.addLayout(ann_btn_row)
+        self.bottom_stack.addWidget(ann_page)
+
+        # ==========================
+        # Bookmark page
+        # ==========================
+        bm_page = QtWidgets.QWidget()
+        bm_layout = QtWidgets.QVBoxLayout(bm_page)
+        bm_layout.setContentsMargins(0, 0, 0, 0)
+        bm_layout.setSpacing(6)
+
+        bm_hdr = QtWidgets.QLabel("Bookmarks")
+        bm_hdr.setAlignment(QtCore.Qt.AlignCenter)
+        bm_hdr.setStyleSheet("QLabel { background: #ede9fe; color: #5b21b6; border-radius: 8px; padding: 5px; font-weight: bold; }")
+        bm_layout.addWidget(bm_hdr)
 
         self.bookmark_table = QtWidgets.QTableWidget(0, 3)
         self.bookmark_table.setHorizontalHeaderLabels(["BOOKMARK TEXT", "LEVEL", "PAGE NO"])
@@ -985,62 +1034,238 @@ class AnnotatorApp(QtWidgets.QWidget):
         bm_header_view.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
         bm_header_view.setSectionResizeMode(1, QtWidgets.QHeaderView.Fixed)
         bm_header_view.setSectionResizeMode(2, QtWidgets.QHeaderView.Fixed)
-
         self.bookmark_table.setColumnWidth(1, 80)
         self.bookmark_table.setColumnWidth(2, 90)
-
         bm_layout.addWidget(self.bookmark_table)
 
-        self.tabs.addTab(ann_tab, "Annotations")
-        self.tabs.addTab(bm_tab, "Bookmarks")
+        bm_btn_row = QtWidgets.QHBoxLayout()
+        bm_btn_row.setSpacing(8)
 
-        bottom_layout.addWidget(self.tabs)
+        self.btn_export_bm = mkbtn("Export Bookmark CSV", "#2563eb", "#4a7df2")
+        self.btn_load_bm = mkbtn("Load Bookmark CSV", "#7c3aed", "#9b63f0")
+        self.btn_delete_bm = mkbtn("Delete Selected Bookmark", "#ef4444", "#f87171")
 
-        self.splitter.addWidget(pdf_widget)
-        self.splitter.addWidget(bottom_widget)
-        layout.addWidget(self.splitter, 1)
+        bm_btn_row.addWidget(self.btn_export_bm)
+        bm_btn_row.addWidget(self.btn_load_bm)
+        bm_btn_row.addStretch()
+        bm_btn_row.addWidget(self.btn_delete_bm)
+
+        bm_layout.addLayout(bm_btn_row)
+        self.bottom_stack.addWidget(bm_page)
+
+        self.splitter.addWidget(self.bottom_stack)
+        normal_layout.addWidget(self.splitter)
+        self.main_stack.addWidget(normal_page)
+
+        # ------------------------------------------------------------------
+        # PAGE 1: REVIEW ONLY (NO PDF)
+        # ------------------------------------------------------------------
+        review_page = QtWidgets.QWidget()
+        review_layout = QtWidgets.QVBoxLayout(review_page)
+        review_layout.setContentsMargins(0, 0, 0, 0)
+        review_layout.setSpacing(6)
+
+        review_hint = QtWidgets.QLabel("Review mode active. Check both tables below and generate the final PDF.")
+        review_hint.setAlignment(QtCore.Qt.AlignCenter)
+        review_hint.setStyleSheet("QLabel { color: #27496d; font-family: 'Times New Roman'; font-size: 11pt; padding: 2px 0; }")
+        review_layout.addWidget(review_hint)
+
+        review_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        review_splitter.setChildrenCollapsible(False)
+        review_splitter.setHandleWidth(8)
+
+        ann_panel = QtWidgets.QWidget()
+        ann_panel_layout = QtWidgets.QVBoxLayout(ann_panel)
+        ann_panel_layout.setContentsMargins(0, 0, 0, 0)
+
+        ann_review_hdr = QtWidgets.QLabel("Annotations")
+        ann_review_hdr.setAlignment(QtCore.Qt.AlignCenter)
+        ann_review_hdr.setStyleSheet("QLabel { background: #dbeafe; color: #1e3a8a; border-radius: 8px; padding: 5px; font-weight: bold; }")
+        ann_panel_layout.addWidget(ann_review_hdr)
+
+        self.review_annotation_table = QtWidgets.QTableWidget(0, 5)
+        self.review_annotation_table.setHorizontalHeaderLabels(["DOMAIN", "NAME", "PAGENO", "ANNOTATION", "ASSIGNED\nFIELD"])
+        self.review_annotation_table.setSelectionBehavior(QtWidgets.QTableWidget.SelectRows)
+        self.review_annotation_table.setSelectionMode(QtWidgets.QTableWidget.SingleSelection)
+        self.review_annotation_table.setEditTriggers(QtWidgets.QTableWidget.NoEditTriggers)
+        self.review_annotation_table.setAlternatingRowColors(True)
+        self.review_annotation_table.verticalHeader().setDefaultSectionSize(28)
+        self.review_annotation_table.setWordWrap(True)
+        self.review_annotation_table.setTextElideMode(QtCore.Qt.ElideNone)
+
+        review_ann_header = self.review_annotation_table.horizontalHeader()
+        review_ann_header.setDefaultAlignment(QtCore.Qt.AlignCenter)
+        review_ann_header.setSectionResizeMode(0, QtWidgets.QHeaderView.Fixed)
+        review_ann_header.setSectionResizeMode(1, QtWidgets.QHeaderView.Fixed)
+        review_ann_header.setSectionResizeMode(2, QtWidgets.QHeaderView.Fixed)
+        review_ann_header.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        review_ann_header.setSectionResizeMode(4, QtWidgets.QHeaderView.Fixed)
+        self.review_annotation_table.setColumnWidth(0, 110)
+        self.review_annotation_table.setColumnWidth(1, 140)
+        self.review_annotation_table.setColumnWidth(2, 80)
+        self.review_annotation_table.setColumnWidth(4, 110)
+        ann_panel_layout.addWidget(self.review_annotation_table)
+
+        bm_panel = QtWidgets.QWidget()
+        bm_panel_layout = QtWidgets.QVBoxLayout(bm_panel)
+        bm_panel_layout.setContentsMargins(0, 0, 0, 0)
+
+        bm_review_hdr = QtWidgets.QLabel("Bookmarks")
+        bm_review_hdr.setAlignment(QtCore.Qt.AlignCenter)
+        bm_review_hdr.setStyleSheet("QLabel { background: #ede9fe; color: #5b21b6; border-radius: 8px; padding: 5px; font-weight: bold; }")
+        bm_panel_layout.addWidget(bm_review_hdr)
+
+        self.review_bookmark_table = QtWidgets.QTableWidget(0, 3)
+        self.review_bookmark_table.setHorizontalHeaderLabels(["BOOKMARK TEXT", "LEVEL", "PAGE NO"])
+        self.review_bookmark_table.setSelectionBehavior(QtWidgets.QTableWidget.SelectRows)
+        self.review_bookmark_table.setSelectionMode(QtWidgets.QTableWidget.SingleSelection)
+        self.review_bookmark_table.setEditTriggers(QtWidgets.QTableWidget.NoEditTriggers)
+        self.review_bookmark_table.setAlternatingRowColors(True)
+        self.review_bookmark_table.verticalHeader().setDefaultSectionSize(28)
+
+        review_bm_header = self.review_bookmark_table.horizontalHeader()
+        review_bm_header.setDefaultAlignment(QtCore.Qt.AlignCenter)
+        review_bm_header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        review_bm_header.setSectionResizeMode(1, QtWidgets.QHeaderView.Fixed)
+        review_bm_header.setSectionResizeMode(2, QtWidgets.QHeaderView.Fixed)
+        self.review_bookmark_table.setColumnWidth(1, 80)
+        self.review_bookmark_table.setColumnWidth(2, 90)
+        bm_panel_layout.addWidget(self.review_bookmark_table)
+
+        review_splitter.addWidget(ann_panel)
+        review_splitter.addWidget(bm_panel)
+        review_splitter.setSizes([700, 500])
+
+        self.btn_generate_pdf = mkbtn("Generate Final Output PDF", "#ff9933", "#ffbc80", "#222")
+
+        review_layout.addWidget(review_splitter, 1)
+        review_layout.addWidget(self.btn_generate_pdf)
+        self.main_stack.addWidget(review_page)
 
         QtCore.QTimer.singleShot(0, self.init_splitter_sizes)
 
-        # connections
-        self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
+        # Connections
         self.btn_open.clicked.connect(self.open_pdf)
         self.btn_prev.clicked.connect(self.prev_page)
         self.btn_next.clicked.connect(self.next_page)
-        self.btn_add_bookmark.clicked.connect(self.add_bookmark)
-        self.btn_delete.clicked.connect(self.delete_selected_row)
-        self.btn_save_ann_csv.clicked.connect(self.export_annotation_csv)
-        self.btn_load_ann_csv.clicked.connect(self.load_annotation_csv)
-        self.btn_save_bm_csv.clicked.connect(self.export_bookmark_csv)
-        self.btn_load_bm_csv.clicked.connect(self.load_bookmark_csv)
+
+        self.btn_annotation.clicked.connect(lambda: self.switch_mode("annotation"))
+        self.btn_bookmark.clicked.connect(lambda: self.switch_mode("bookmark"))
+        self.btn_review.clicked.connect(self.open_review_safe)
+
         self.btn_generate_pdf.clicked.connect(self.generate_final_output_pdf)
 
         self.annotation_table.itemSelectionChanged.connect(self.on_annotation_selection_changed)
         self.bookmark_table.itemSelectionChanged.connect(self.on_bookmark_selection_changed)
 
-        self.on_mode_changed(0)
+        self.review_annotation_table.itemSelectionChanged.connect(self.on_review_annotation_selection_changed)
+        self.review_bookmark_table.itemSelectionChanged.connect(self.on_review_bookmark_selection_changed)
+
+        self.btn_export_ann.clicked.connect(self.export_annotations_csv)
+        self.btn_load_ann.clicked.connect(self.load_annotations_csv)
+        self.btn_delete_ann.clicked.connect(self.delete_selected_annotation)
+
+        self.btn_export_bm.clicked.connect(self.export_bookmarks_csv)
+        self.btn_load_bm.clicked.connect(self.load_bookmarks_csv)
+        self.btn_delete_bm.clicked.connect(self.delete_selected_bookmark)
+
+        self.switch_mode("annotation", force=True)
 
     def init_splitter_sizes(self):
-        total = max(self.height() - 180, 700)
-        self.splitter.setSizes([int(total * 0.78), int(total * 0.22)])
+        total = max(self.height() - 200, 700)
+        if self.active_mode in ("annotation", "bookmark"):
+            self.splitter.setSizes([int(total * 0.80), int(total * 0.20)])
+        else:
+            self.splitter.setSizes([int(total * 0.72), int(total * 0.28)])
 
-    # ------------------------------------------------------------------
-    # Mode
-    # ------------------------------------------------------------------
-    def on_mode_changed(self, idx):
-        self.active_mode = "annotation" if idx == 0 else "bookmark"
+    def set_active_mode_button_styles(self):
+        base_off = 0.95
 
-        is_annotation = self.active_mode == "annotation"
+        def style_button(btn, bg, hover, active=False):
+            if active:
+                btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background-color: {bg};
+                        color: white;
+                        font-family: 'Times New Roman';
+                        font-weight: bold;
+                        font-size: 11pt;
+                        border-radius: 10px;
+                        padding: 6px 14px;
+                        min-height: 34px;
+                        border: 3px solid #111827;
+                    }}
+                    QPushButton:hover:!disabled {{
+                        background-color: {hover};
+                    }}
+                    QPushButton:disabled {{
+                        background-color: #d9d9d9;
+                        color: #7a7a7a;
+                        border: 1px solid #c8c8c8;
+                    }}
+                """)
+            else:
+                btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background-color: {bg};
+                        color: white;
+                        font-family: 'Times New Roman';
+                        font-weight: bold;
+                        font-size: 11pt;
+                        border-radius: 10px;
+                        padding: 6px 14px;
+                        min-height: 34px;
+                        border: 1px solid #00000022;
+                    }}
+                    QPushButton:hover:!disabled {{
+                        background-color: {hover};
+                    }}
+                    QPushButton:disabled {{
+                        background-color: #d9d9d9;
+                        color: #7a7a7a;
+                        border: 1px solid #c8c8c8;
+                    }}
+                """)
 
-        self.btn_save_ann_csv.setVisible(is_annotation)
-        self.btn_load_ann_csv.setVisible(is_annotation)
+        style_button(self.btn_annotation, "#2563eb", "#4a7df2", self.active_mode == "annotation")
+        style_button(self.btn_bookmark, "#7c3aed", "#9b63f0", self.active_mode == "bookmark")
+        style_button(self.btn_review, "#059669", "#21b58a", self.active_mode == "review")
 
-        self.btn_save_bm_csv.setVisible(not is_annotation)
-        self.btn_load_bm_csv.setVisible(not is_annotation)
-        self.btn_add_bookmark.setVisible(not is_annotation)
+    def switch_mode(self, mode, force=False):
+        if not force and mode in ("annotation", "bookmark", "review") and not self.pdf_loaded and mode != "annotation":
+            return
 
-        self.tabs.setCurrentIndex(0 if is_annotation else 1)
+        self.active_mode = mode
+        self.set_active_mode_button_styles()
+
+        if mode == "annotation":
+            self.main_stack.setCurrentIndex(0)
+            self.bottom_stack.setCurrentIndex(0)
+            self.tip.setText("Click anywhere on the PDF to add annotation. Drag an existing box to reposition it.")
+            QtCore.QTimer.singleShot(0, lambda: self.splitter.setSizes([int(max(self.height() - 200, 700) * 0.82), int(max(self.height() - 200, 700) * 0.18)]))
+        elif mode == "bookmark":
+            self.main_stack.setCurrentIndex(0)
+            self.bottom_stack.setCurrentIndex(1)
+            self.tip.setText("Click anywhere on the PDF to add bookmark for the current page.")
+            QtCore.QTimer.singleShot(0, lambda: self.splitter.setSizes([int(max(self.height() - 200, 700) * 0.82), int(max(self.height() - 200, 700) * 0.18)]))
+        else:
+            self.main_stack.setCurrentIndex(1)
+            self.refresh_review_tables()
+
         self.image_label.update()
+
+    def open_review_safe(self):
+        if not self.btn_review.isEnabled():
+            return
+        self.switch_mode("review")
+
+    def update_navigation_buttons(self):
+        has_pdf = self.doc is not None
+        self.btn_prev.setEnabled(has_pdf and self.current_page_index > 0)
+        self.btn_next.setEnabled(has_pdf and self.current_page_index < len(self.doc) - 1)
+
+    def check_review_enable(self):
+        self.btn_review.setEnabled(self.has_annotation or self.has_bookmark)
 
     # ------------------------------------------------------------------
     # PDF open / render
@@ -1061,9 +1286,20 @@ class AnnotatorApp(QtWidgets.QWidget):
             self.last_click_pdf_x = None
             self.last_click_pdf_y = None
             self.last_click_pageh = None
+
+            self.pdf_loaded = True
+            self.has_annotation = False
+            self.has_bookmark = False
+
+            self.btn_annotation.setEnabled(True)
+            self.btn_bookmark.setEnabled(True)
+            self.check_review_enable()
+
             self.refresh_annotation_table()
             self.refresh_bookmark_table()
+            self.refresh_review_tables()
             self.render_page()
+            self.switch_mode("annotation")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Error", f"Unable to open PDF:\n{e}")
 
@@ -1083,6 +1319,7 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.image_label.update()
 
         self.page_info.setText(f"Page: {self.current_page_index + 1} / {len(self.doc)}")
+        self.update_navigation_buttons()
 
     def prev_page(self):
         if self.doc and self.current_page_index > 0:
@@ -1136,16 +1373,17 @@ class AnnotatorApp(QtWidgets.QWidget):
 
         self.entries.append(entry)
         self.selected_entry_index = len(self.entries) - 1
+
         self.refresh_annotation_table()
+        self.refresh_review_tables()
         self.select_annotation_row_silent(self.selected_entry_index)
         self.image_label.update()
 
-    # ------------------------------------------------------------------
-    # Add bookmark
-    # ------------------------------------------------------------------
-    def add_bookmark(self):
+        self.has_annotation = True
+        self.check_review_enable()
+
+    def capture_bookmark_point(self):
         if not self.doc:
-            QtWidgets.QMessageBox.information(self, "Info", "Open a PDF first.")
             return
 
         dlg = BookmarkDialog(self.current_page_index + 1, self)
@@ -1160,9 +1398,14 @@ class AnnotatorApp(QtWidgets.QWidget):
         )
         self.bookmarks.append(bm)
         self.selected_bookmark_index = len(self.bookmarks) - 1
+
         self.refresh_bookmark_table()
+        self.refresh_review_tables()
         self.select_bookmark_row_silent(self.selected_bookmark_index)
         self.image_label.update()
+
+        self.has_bookmark = True
+        self.check_review_enable()
 
     # ------------------------------------------------------------------
     # Annotation table
@@ -1170,6 +1413,7 @@ class AnnotatorApp(QtWidgets.QWidget):
     def refresh_annotation_table(self):
         self._suppress_annotation_selection_signal = True
         self.annotation_table.setRowCount(0)
+
         for row_idx, e in enumerate(self.entries):
             self.annotation_table.insertRow(row_idx)
             vals = [e.domain, e.name, str(e.pageno), e.annotation, e.assignedfield]
@@ -1180,8 +1424,25 @@ class AnnotatorApp(QtWidgets.QWidget):
                 elif col_idx == 3:
                     item.setTextAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
                 self.annotation_table.setItem(row_idx, col_idx, item)
+
         self.annotation_table.resizeRowsToContents()
         self._suppress_annotation_selection_signal = False
+
+    def populate_review_annotation_table(self):
+        self.review_annotation_table.setRowCount(0)
+
+        for row_idx, e in enumerate(self.entries):
+            self.review_annotation_table.insertRow(row_idx)
+            vals = [e.domain, e.name, str(e.pageno), e.annotation, e.assignedfield]
+            for col_idx, val in enumerate(vals):
+                item = QtWidgets.QTableWidgetItem(val)
+                if col_idx in (0, 1, 2, 4):
+                    item.setTextAlignment(QtCore.Qt.AlignCenter)
+                elif col_idx == 3:
+                    item.setTextAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+                self.review_annotation_table.setItem(row_idx, col_idx, item)
+
+        self.review_annotation_table.resizeRowsToContents()
 
     def select_annotation_row_silent(self, row_idx: int):
         if row_idx < 0 or row_idx >= self.annotation_table.rowCount():
@@ -1210,12 +1471,22 @@ class AnnotatorApp(QtWidgets.QWidget):
             self.selected_entry_index = -1
         self.image_label.update()
 
+    def on_review_annotation_selection_changed(self):
+        row = self.review_annotation_table.currentRow()
+        if 0 <= row < len(self.entries):
+            self.selected_entry_index = row
+            entry = self.entries[row]
+            if self.doc:
+                self.current_page_index = max(0, entry.pageno - 1)
+                self.render_page()
+
     # ------------------------------------------------------------------
     # Bookmark table
     # ------------------------------------------------------------------
     def refresh_bookmark_table(self):
         self._suppress_bookmark_selection_signal = True
         self.bookmark_table.setRowCount(0)
+
         for row_idx, b in enumerate(self.bookmarks):
             self.bookmark_table.insertRow(row_idx)
             vals = [b.title, str(b.level), str(b.pageno)]
@@ -1226,8 +1497,25 @@ class AnnotatorApp(QtWidgets.QWidget):
                 else:
                     item.setTextAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
                 self.bookmark_table.setItem(row_idx, col_idx, item)
+
         self.bookmark_table.resizeRowsToContents()
         self._suppress_bookmark_selection_signal = False
+
+    def populate_review_bookmark_table(self):
+        self.review_bookmark_table.setRowCount(0)
+
+        for row_idx, b in enumerate(self.bookmarks):
+            self.review_bookmark_table.insertRow(row_idx)
+            vals = [b.title, str(b.level), str(b.pageno)]
+            for col_idx, val in enumerate(vals):
+                item = QtWidgets.QTableWidgetItem(val)
+                if col_idx in (1, 2):
+                    item.setTextAlignment(QtCore.Qt.AlignCenter)
+                else:
+                    item.setTextAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+                self.review_bookmark_table.setItem(row_idx, col_idx, item)
+
+        self.review_bookmark_table.resizeRowsToContents()
 
     def select_bookmark_row_silent(self, row_idx: int):
         if row_idx < 0 or row_idx >= self.bookmark_table.rowCount():
@@ -1252,160 +1540,256 @@ class AnnotatorApp(QtWidgets.QWidget):
             self.selected_bookmark_index = -1
         self.image_label.update()
 
-    # ------------------------------------------------------------------
-    # Delete selected
-    # ------------------------------------------------------------------
-    def delete_selected_row(self):
-        if self.active_mode == "annotation":
-            row = self.annotation_table.currentRow()
-            if row < 0:
-                QtWidgets.QMessageBox.information(self, "Info", "Select an annotation row to delete.")
-                return
-            del self.entries[row]
-            self.selected_entry_index = min(row, len(self.entries) - 1) if self.entries else -1
-            self.refresh_annotation_table()
-            if self.selected_entry_index >= 0:
-                self.select_annotation_row_silent(self.selected_entry_index)
-        else:
-            row = self.bookmark_table.currentRow()
-            if row < 0:
-                QtWidgets.QMessageBox.information(self, "Info", "Select a bookmark row to delete.")
-                return
-            del self.bookmarks[row]
-            self.selected_bookmark_index = min(row, len(self.bookmarks) - 1) if self.bookmarks else -1
-            self.refresh_bookmark_table()
-            if self.selected_bookmark_index >= 0:
-                self.select_bookmark_row_silent(self.selected_bookmark_index)
+    def on_review_bookmark_selection_changed(self):
+        row = self.review_bookmark_table.currentRow()
+        if 0 <= row < len(self.bookmarks):
+            self.selected_bookmark_index = row
+            bm = self.bookmarks[row]
+            if self.doc:
+                self.current_page_index = max(0, bm.pageno - 1)
+                self.render_page()
 
+    def refresh_review_tables(self):
+        self.populate_review_annotation_table()
+        self.populate_review_bookmark_table()
+
+    # ------------------------------------------------------------------
+    # Delete actions
+    # ------------------------------------------------------------------
+    def delete_selected_annotation(self):
+        row = self.annotation_table.currentRow()
+        if row < 0 or row >= len(self.entries):
+            QtWidgets.QMessageBox.information(self, "Delete Annotation", "Please select an annotation row to delete.")
+            return
+
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Delete Annotation",
+            "Delete the selected annotation?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+
+        del self.entries[row]
+        self.selected_entry_index = -1
+        self.refresh_annotation_table()
+        self.refresh_review_tables()
         self.image_label.update()
 
+        self.has_annotation = len(self.entries) > 0
+        self.check_review_enable()
+
+    def delete_selected_bookmark(self):
+        row = self.bookmark_table.currentRow()
+        if row < 0 or row >= len(self.bookmarks):
+            QtWidgets.QMessageBox.information(self, "Delete Bookmark", "Please select a bookmark row to delete.")
+            return
+
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Delete Bookmark",
+            "Delete the selected bookmark?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+
+        del self.bookmarks[row]
+        self.selected_bookmark_index = -1
+        self.refresh_bookmark_table()
+        self.refresh_review_tables()
+        self.image_label.update()
+
+        self.has_bookmark = len(self.bookmarks) > 0
+        self.check_review_enable()
+
     # ------------------------------------------------------------------
-    # CSV export / load
+    # CSV export / import
     # ------------------------------------------------------------------
-    def export_annotation_csv(self):
+    def export_annotations_csv(self):
         if not self.entries:
-            QtWidgets.QMessageBox.information(self, "No Data", "No annotations captured.")
+            QtWidgets.QMessageBox.information(self, "Export Annotation CSV", "No annotations available to export.")
             return
 
-        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save Annotation CSV", "annotate_input.csv", "CSV Files (*.csv)"
+        default_path = os.path.join(
+            os.path.dirname(self.open_pdf_path) if self.open_pdf_path else SCRIPT_DIR,
+            "annotation_entries.csv"
         )
-        if not file_path:
+        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export Annotation CSV", default_path, "CSV Files (*.csv)"
+        )
+        if not out_path:
             return
 
         try:
-            with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
-                writer.writerow(["DOMAIN", "NAME", "PAGENO", "ANNOTATION", "ASSIGNEDFIELD", "X1", "Y1", "PAGEH"])
+            with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=ANNOTATION_CSV_COLUMNS)
+                writer.writeheader()
                 for e in self.entries:
-                    writer.writerow([
-                        e.domain, e.name, e.pageno, e.annotation, e.assignedfield,
-                        f"{e.x1:.6f}", f"{e.y1:.6f}", f"{e.pageh:.6f}"
-                    ])
-            self.current_annotation_csv_path = file_path
-            QtWidgets.QMessageBox.information(self, "Success", f"Annotation CSV exported:\n{file_path}")
+                    writer.writerow({
+                        "DOMAIN": e.domain,
+                        "NAME": e.name,
+                        "PAGENO": e.pageno,
+                        "ANNOTATION": e.annotation,
+                        "ASSIGNEDFIELD": e.assignedfield,
+                        "X1": e.x1,
+                        "Y1": e.y1,
+                        "PAGEH": e.pageh,
+                    })
+            QtWidgets.QMessageBox.information(self, "Export Annotation CSV", f"Annotation CSV exported successfully:\n{out_path}")
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to export annotation CSV:\n{e}")
+            QtWidgets.QMessageBox.critical(self, "Export Annotation CSV", f"Failed to export annotation CSV:\n{e}")
 
-    def load_annotation_csv(self):
-        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Load Annotation CSV",
-            self.current_annotation_csv_path if self.current_annotation_csv_path else "",
-            "CSV Files (*.csv)"
+    def load_annotations_csv(self):
+        if not self.doc:
+            QtWidgets.QMessageBox.warning(self, "Load Annotation CSV", "Please open the source PDF first.")
+            return
+
+        in_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load Annotation CSV", "", "CSV Files (*.csv)"
         )
-        if not file_path:
+        if not in_path:
             return
 
         try:
-            loaded = []
-            with open(file_path, "r", encoding="utf-8-sig", newline="") as f:
+            loaded_entries = []
+            with open(in_path, "r", newline="", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
-                for r in reader:
-                    domain = (r.get("DOMAIN") or "").strip()
-                    name = (r.get("NAME") or "").strip()
-                    annotation = (r.get("ANNOTATION") or "").strip()
-                    assignedfield = (r.get("ASSIGNEDFIELD") or "").strip()
-                    is_not_submitted = annotation.strip().upper() == "[NOT SUBMITTED]"
-                    is_domain_annotation = (name == "") and not is_not_submitted
-                    is_assigned_field = assignedfield.upper() == "Y"
+                expected = set(ANNOTATION_CSV_COLUMNS)
+                actual = set([c.strip().upper() for c in (reader.fieldnames or [])])
 
-                    loaded.append(
+                if not expected.issubset(actual):
+                    raise ValueError(
+                        "Annotation CSV is missing required columns.\n"
+                        f"Required: {', '.join(ANNOTATION_CSV_COLUMNS)}"
+                    )
+
+                for row in reader:
+                    domain = (row.get("DOMAIN") or "").strip()
+                    name = (row.get("NAME") or "").strip()
+                    annotation = (row.get("ANNOTATION") or "").strip()
+                    assignedfield = (row.get("ASSIGNEDFIELD") or "").strip()
+                    pageno = int(float(row.get("PAGENO") or 0))
+                    x1 = float(row.get("X1") or 0)
+                    y1 = float(row.get("Y1") or 0)
+                    pageh = float(row.get("PAGEH") or (self.page_rect.height if self.page_rect else 0))
+
+                    is_domain_annotation, is_assigned_field, is_not_submitted = bool_from_entry(
+                        domain, name, annotation, assignedfield
+                    )
+
+                    loaded_entries.append(
                         AnnotationEntry(
                             domain=domain,
                             name=name,
-                            pageno=int(float(r.get("PAGENO", 0) or 0)),
+                            pageno=pageno,
                             annotation=annotation,
                             assignedfield=assignedfield,
-                            x1=float(r.get("X1", 0) or 0),
-                            y1=float(r.get("Y1", 0) or 0),
-                            pageh=float(r.get("PAGEH", 0) or 0),
+                            x1=x1,
+                            y1=y1,
+                            pageh=pageh,
                             is_domain_annotation=is_domain_annotation,
                             is_assigned_field=is_assigned_field,
                             is_not_submitted=is_not_submitted
                         )
                     )
 
-            self.entries = loaded
-            self.current_annotation_csv_path = file_path
+            self.entries = loaded_entries
             self.selected_entry_index = -1
             self.refresh_annotation_table()
+            self.refresh_review_tables()
             self.image_label.update()
-            QtWidgets.QMessageBox.information(self, "Loaded", f"Loaded annotation CSV:\n{file_path}")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to load annotation CSV:\n{e}")
 
-    def export_bookmark_csv(self):
+            self.has_annotation = len(self.entries) > 0
+            self.check_review_enable()
+
+            QtWidgets.QMessageBox.information(self, "Load Annotation CSV", f"Loaded {len(self.entries)} annotation row(s).")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Load Annotation CSV", f"Failed to load annotation CSV:\n{e}")
+
+    def export_bookmarks_csv(self):
         if not self.bookmarks:
-            QtWidgets.QMessageBox.information(self, "No Data", "No bookmarks captured.")
+            QtWidgets.QMessageBox.information(self, "Export Bookmark CSV", "No bookmarks available to export.")
             return
 
-        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save Bookmark CSV", "bookmarks.csv", "CSV Files (*.csv)"
+        default_path = os.path.join(
+            os.path.dirname(self.open_pdf_path) if self.open_pdf_path else SCRIPT_DIR,
+            "bookmark_entries.csv"
         )
-        if not file_path:
+        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export Bookmark CSV", default_path, "CSV Files (*.csv)"
+        )
+        if not out_path:
             return
 
         try:
-            with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
-                writer.writerow(["TITLE", "LEVEL", "PAGENO"])
+            with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=BOOKMARK_CSV_COLUMNS)
+                writer.writeheader()
                 for b in self.bookmarks:
-                    writer.writerow([b.title, b.level, b.pageno])
-            self.current_bookmark_csv_path = file_path
-            QtWidgets.QMessageBox.information(self, "Success", f"Bookmark CSV exported:\n{file_path}")
+                    writer.writerow({
+                        "TITLE": b.title,
+                        "LEVEL": b.level,
+                        "PAGENO": b.pageno,
+                    })
+            QtWidgets.QMessageBox.information(self, "Export Bookmark CSV", f"Bookmark CSV exported successfully:\n{out_path}")
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to export bookmark CSV:\n{e}")
+            QtWidgets.QMessageBox.critical(self, "Export Bookmark CSV", f"Failed to export bookmark CSV:\n{e}")
 
-    def load_bookmark_csv(self):
-        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Load Bookmark CSV",
-            self.current_bookmark_csv_path if self.current_bookmark_csv_path else "",
-            "CSV Files (*.csv)"
+    def load_bookmarks_csv(self):
+        if not self.doc:
+            QtWidgets.QMessageBox.warning(self, "Load Bookmark CSV", "Please open the source PDF first.")
+            return
+
+        in_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load Bookmark CSV", "", "CSV Files (*.csv)"
         )
-        if not file_path:
+        if not in_path:
             return
 
         try:
-            loaded = []
-            with open(file_path, "r", encoding="utf-8-sig", newline="") as f:
+            loaded_bookmarks = []
+            with open(in_path, "r", newline="", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
-                for r in reader:
-                    loaded.append(
+                expected = set(BOOKMARK_CSV_COLUMNS)
+                actual = set([c.strip().upper() for c in (reader.fieldnames or [])])
+
+                if not expected.issubset(actual):
+                    raise ValueError(
+                        "Bookmark CSV is missing required columns.\n"
+                        f"Required: {', '.join(BOOKMARK_CSV_COLUMNS)}"
+                    )
+
+                for row in reader:
+                    title = (row.get("TITLE") or "").strip()
+                    if not title:
+                        continue
+                    level = int(float(row.get("LEVEL") or 1))
+                    pageno = int(float(row.get("PAGENO") or 1))
+
+                    loaded_bookmarks.append(
                         BookmarkEntry(
-                            title=(r.get("TITLE") or "").strip(),
-                            level=int(float(r.get("LEVEL", 1) or 1)),
-                            pageno=int(float(r.get("PAGENO", 1) or 1))
+                            title=title,
+                            level=level,
+                            pageno=pageno
                         )
                     )
 
-            self.bookmarks = loaded
-            self.current_bookmark_csv_path = file_path
+            self.bookmarks = loaded_bookmarks
             self.selected_bookmark_index = -1
             self.refresh_bookmark_table()
+            self.refresh_review_tables()
             self.image_label.update()
-            QtWidgets.QMessageBox.information(self, "Loaded", f"Loaded bookmark CSV:\n{file_path}")
+
+            self.has_bookmark = len(self.bookmarks) > 0
+            self.check_review_enable()
+
+            QtWidgets.QMessageBox.information(self, "Load Bookmark CSV", f"Loaded {len(self.bookmarks)} bookmark row(s).")
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to load bookmark CSV:\n{e}")
+            QtWidgets.QMessageBox.critical(self, "Load Bookmark CSV", f"Failed to load bookmark CSV:\n{e}")
 
     # ------------------------------------------------------------------
     # Final PDF generation
@@ -1430,15 +1814,13 @@ class AnnotatorApp(QtWidgets.QWidget):
             QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
             doc = fitz.open(self.open_pdf_path)
 
-            # Write annotations
             if self.entries:
-                color_map = get_domain_color_map(self.entries)
-
                 for e in self.entries:
                     if e.pageno < 1 or e.pageno > len(doc):
                         continue
 
                     page = doc[e.pageno - 1]
+                    color_map = get_page_domain_color_map(self.entries, e.pageno)
                     layout = compute_entry_layout(e, color_map, page_width=page.rect.width)
                     rect = rect_from_top_origin(e.x1, e.y1, layout["box_w"], layout["box_h"], e.pageh)
 
@@ -1464,7 +1846,6 @@ class AnnotatorApp(QtWidgets.QWidget):
                         font_size=layout["font_size"]
                     )
 
-            # Write bookmarks
             if self.bookmarks:
                 toc = []
                 for bm in self.bookmarks:
@@ -1473,7 +1854,6 @@ class AnnotatorApp(QtWidgets.QWidget):
                     title = bm.title.strip()
                     if title:
                         toc.append([lvl, title, pg])
-
                 if toc:
                     doc.set_toc(toc)
 
