@@ -498,9 +498,10 @@ class BookmarkDialog(QtWidgets.QDialog):
     def __init__(self, page_no: int, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Bookmark Details")
-        self.resize(520, 230)
-        self.setMinimumSize(520, 230)
         self.setModal(True)
+        self.resize(760, 330)
+        self.setMinimumSize(760, 330)
+        self.setSizeGripEnabled(False)
 
         self.setStyleSheet("""
             QDialog { background-color: #f4f8ff; border-radius: 14px; }
@@ -508,10 +509,14 @@ class BookmarkDialog(QtWidgets.QDialog):
             QLineEdit, QSpinBox {
                 background: #ffffff; border: 1px solid #a8bfdc; border-radius: 8px;
                 padding: 6px 8px; font-family: 'Times New Roman'; font-size: 12pt; color: #1a1a1a;
+                min-height: 22px;
             }
-            QDialogButtonBox QPushButton {
+            QLineEdit:focus, QSpinBox:focus {
+                border: 2px solid #8b5cf6; background: #fdfefe;
+            }
+            QPushButton {
                 font-family: 'Times New Roman'; font-size: 12pt; font-weight: bold;
-                border-radius: 10px; padding: 8px 18px; min-width: 100px;
+                border-radius: 10px; padding: 8px 18px; min-width: 140px; min-height: 38px;
             }
         """)
 
@@ -525,17 +530,22 @@ class BookmarkDialog(QtWidgets.QDialog):
         """)
 
         self.title_edit = QtWidgets.QLineEdit()
+        self.title_edit.setMinimumWidth(420)
 
         self.level_spin = QtWidgets.QSpinBox()
         self.level_spin.setRange(1, 9)
         self.level_spin.setValue(1)
+        self.level_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.UpDownArrows)
 
         self.page_spin = QtWidgets.QSpinBox()
         self.page_spin.setRange(1, 999999)
         self.page_spin.setValue(page_no)
+        self.page_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.UpDownArrows)
 
         form = QtWidgets.QFormLayout()
-        form.setLabelAlignment(QtCore.Qt.AlignRight)
+        form.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        form.setFormAlignment(QtCore.Qt.AlignTop)
+        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
         form.setHorizontalSpacing(18)
         form.setVerticalSpacing(14)
         form.addRow("Bookmark Text", self.title_edit)
@@ -546,22 +556,29 @@ class BookmarkDialog(QtWidgets.QDialog):
         note.setWordWrap(True)
         note.setStyleSheet("QLabel { color: #556b84; font-size: 11pt; font-style: italic; }")
 
-        self.buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        self.buttons.accepted.connect(self.validate_and_accept)
-        self.buttons.rejected.connect(self.reject)
+        self.ok_btn = QtWidgets.QPushButton("OK")
+        self.cancel_btn = QtWidgets.QPushButton("Cancel")
+        self.ok_btn.clicked.connect(self.validate_and_accept)
+        self.cancel_btn.clicked.connect(self.reject)
+        self.ok_btn.setStyleSheet("QPushButton { background-color: #55c16d; color: white; } QPushButton:hover { background-color: #73d789; }")
+        self.cancel_btn.setStyleSheet("QPushButton { background-color: #f16a6a; color: white; } QPushButton:hover { background-color: #f48f8f; }")
 
-        ok_btn = self.buttons.button(QtWidgets.QDialogButtonBox.Ok)
-        cancel_btn = self.buttons.button(QtWidgets.QDialogButtonBox.Cancel)
-        ok_btn.setStyleSheet("QPushButton { background-color: #55c16d; color: white; } QPushButton:hover { background-color: #73d789; }")
-        cancel_btn.setStyleSheet("QPushButton { background-color: #f16a6a; color: white; } QPushButton:hover { background-color: #f48f8f; }")
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch()
+        btn_row.addWidget(self.ok_btn)
+        btn_row.addSpacing(12)
+        btn_row.addWidget(self.cancel_btn)
 
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+        layout.setSizeConstraint(QtWidgets.QLayout.SetFixedSize)
         layout.addWidget(title_hdr)
-        layout.addSpacing(10)
+        layout.addSpacing(6)
         layout.addLayout(form)
         layout.addWidget(note)
         layout.addSpacing(8)
-        layout.addWidget(self.buttons)
+        layout.addLayout(btn_row)
 
     def validate_and_accept(self):
         if not self.title_edit.text().strip():
