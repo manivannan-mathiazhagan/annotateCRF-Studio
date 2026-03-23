@@ -249,7 +249,7 @@ Preview colors shown in the tool are temporary. Final output can be aligned with
 
 For queries, suggestions, or issues:
 
-[Manivannan.Mathialagan@veristat.com](mailto:Manivannan.Mathialagan@veristat.com)
+[Manivannan.Mathi@outlook.com](mailto:Manivannan.Mathi@outlook.com)
 
 ---
 
