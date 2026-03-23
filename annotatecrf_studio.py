@@ -107,7 +107,7 @@ LONG_TEXT_MIN_WIDTH = 220.0
 BOOKMARK_PREVIEW_COLOR = QtGui.QColor("#7c3aed")
 BOOKMARK_PREVIEW_TEXT_COLOR = QtGui.QColor("#5b21b6")
 
-ANNOTATION_CSV_COLUMNS = ["DOMAIN", "NAME", "PAGENO", "ANNOTATION", "ASSIGNEDFIELD", "X1", "Y1", "PAGEH"]
+ANNOTATION_CSV_COLUMNS = ["TYPE", "DOMAIN", "NAME", "PAGENO", "ANNOTATION", "ASSIGNEDFIELD", "X1", "Y1", "PAGEH", "BOX_W", "BOX_H", "LINE_PAGENO", "LINE_X1", "LINE_Y1", "LINE_X2", "LINE_Y2"]
 BOOKMARK_CSV_COLUMNS = ["TITLE", "LEVEL", "PAGENO"]
 
 CHAR_WIDTHS = {
@@ -139,24 +139,51 @@ def estimate_text_width(text: str, scale: float = 1.0) -> float:
     return total * scale + 5 * scale
 
 
-def wrap_text_by_width(text: str, max_width: float, scale: float = 1.0) -> List[str]:
-    if not text:
-        return [""]
-    words = text.split()
-    if not words:
-        return [text]
+def clean_number(value, default=None):
+    try:
+        s = str(value).replace(" ", "").strip()
+        if s == "":
+            return default
+        return float(s)
+    except Exception:
+        return default
 
-    lines = []
-    current = words[0]
-    for word in words[1:]:
-        trial = current + " " + word
-        if estimate_text_width(trial, scale) <= max_width:
-            current = trial
-        else:
-            lines.append(current)
-            current = word
-    lines.append(current)
-    return lines
+
+def wrap_text_by_width(text: str, max_width: float, scale: float = 1.0) -> List[str]:
+    if text is None:
+        return [""]
+    text = str(text).replace("	", "    ")
+    if text == "":
+        return [""]
+
+    final_lines = []
+    raw_lines = text.splitlines() or [text]
+
+    for raw_line in raw_lines:
+        if raw_line == "":
+            final_lines.append("")
+            continue
+
+        indent_len = len(raw_line) - len(raw_line.lstrip(" "))
+        indent = raw_line[:indent_len]
+        content = raw_line[indent_len:]
+
+        if content == "":
+            final_lines.append(indent)
+            continue
+
+        words = content.split()
+        current = indent + words[0]
+        for word in words[1:]:
+            trial = current + " " + word
+            if estimate_text_width(trial, scale) <= max_width:
+                current = trial
+            else:
+                final_lines.append(current)
+                current = indent + word
+        final_lines.append(current)
+
+    return final_lines or [""]
 
 
 def rect_from_top_origin(x1: float, y1_top: float, width: float, height: float, pageh: float) -> fitz.Rect:
@@ -193,8 +220,8 @@ def compute_entry_layout(entry, color_map, page_width=None):
     scale = DOMAIN_FONT_SIZE / BASE_FONT_SIZE if bold else 1.0
     base_h = BOX_HEIGHT_DOMAIN if bold else BOX_HEIGHT_NORMAL
 
-    text = (entry.annotation or "").strip()
-    raw_w = estimate_text_width(text, scale=scale)
+    text = (entry.annotation or "").replace("	", "    ").rstrip()
+    raw_w = max((estimate_text_width(line, scale=scale) for line in (text.splitlines() or [text])), default=MIN_BOX_WIDTH)
 
     allowed_width = MAX_WRAP_WIDTH
     if page_width is not None:
@@ -207,19 +234,30 @@ def compute_entry_layout(entry, color_map, page_width=None):
         len(text) >= LONG_TEXT_THRESHOLD
         or " when " in f" {text.lower()} "
         or "/" in text
+        or "\n" in text
     )
     if long_text:
         preferred_width = max(preferred_width, LONG_TEXT_MIN_WIDTH)
 
-    box_w = min(allowed_width, preferred_width)
-    box_w = max(MIN_BOX_WIDTH, box_w)
+    explicit_w = clean_number(getattr(entry, "box_w", None), None)
+    if explicit_w is not None:
+        box_w = max(MIN_BOX_WIDTH, min(allowed_width, explicit_w))
+    else:
+        box_w = min(allowed_width, preferred_width)
+        box_w = max(MIN_BOX_WIDTH, box_w)
 
     lines = wrap_text_by_width(text, box_w, scale=scale)
     actual_w = max(estimate_text_width(line, scale=scale) for line in lines) if lines else raw_w
-    box_w = min(allowed_width, max(box_w, actual_w))
-    box_w = max(MIN_BOX_WIDTH, box_w)
+    if explicit_w is None:
+        box_w = min(allowed_width, max(box_w, actual_w))
+        box_w = max(MIN_BOX_WIDTH, box_w)
 
-    box_h = max(base_h, len(lines) * (font_size + 1.2) + 4)
+    computed_h = max(base_h, len(lines) * (font_size + 1.2) + 4)
+    explicit_h = clean_number(getattr(entry, "box_h", None), None)
+    if explicit_h is not None:
+        box_h = max(base_h, explicit_h)
+    else:
+        box_h = computed_h
 
     return {
         "fill": fill,
@@ -302,6 +340,12 @@ class AnnotationEntry:
     is_domain_annotation: bool
     is_assigned_field: bool
     is_not_submitted: bool
+    box_w: Optional[float] = None
+    box_h: Optional[float] = None
+    line_x1: Optional[float] = None
+    line_y1: Optional[float] = None
+    line_x2: Optional[float] = None
+    line_y2: Optional[float] = None
 
 
 @dataclass
@@ -309,6 +353,15 @@ class BookmarkEntry:
     title: str
     level: int
     pageno: int
+
+
+@dataclass
+class ConnectorLineEntry:
+    pageno: int
+    x1: float
+    y1: float
+    x2: float
+    y2: float
 
 
 # ================================
@@ -442,7 +495,7 @@ class AnnotationDialog(QtWidgets.QDialog):
                 self.domain_edit.clear()
             if self.name_edit.text().strip() == "NOTSUB":
                 self.name_edit.clear()
-            if self.annotation_edit.toPlainText().strip() == "[NOT SUBMITTED]":
+            if self.annotation_edit.toPlainText().replace("\t", "    ").rstrip() == "[NOT SUBMITTED]":
                 self.annotation_edit.clear()
 
             is_domain = self.chk_domain.isChecked()
@@ -455,7 +508,7 @@ class AnnotationDialog(QtWidgets.QDialog):
         if not self.domain_edit.text().strip():
             QtWidgets.QMessageBox.warning(self, "Validation", "DOMAIN is required.")
             return
-        if not self.annotation_edit.toPlainText().strip():
+        if not self.annotation_edit.toPlainText().replace("\t", "    ").rstrip():
             QtWidgets.QMessageBox.warning(self, "Validation", "ANNOTATION is required.")
             return
         if not self.chk_domain.isChecked() and not self.chk_notsub.isChecked():
@@ -483,7 +536,7 @@ class AnnotationDialog(QtWidgets.QDialog):
         return {
             "domain": self.domain_edit.text().strip(),
             "name": "" if is_domain_annotation else self.name_edit.text().strip(),
-            "annotation": self.annotation_edit.toPlainText().strip(),
+            "annotation": self.annotation_edit.toPlainText().replace("\t", "    ").rstrip(),
             "assignedfield": "Y" if is_assigned_field else "",
             "is_domain_annotation": is_domain_annotation,
             "is_assigned_field": is_assigned_field,
@@ -498,10 +551,9 @@ class BookmarkDialog(QtWidgets.QDialog):
     def __init__(self, page_no: int, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Bookmark Details")
-        self.setModal(True)
         self.resize(760, 330)
         self.setMinimumSize(760, 330)
-        self.setSizeGripEnabled(False)
+        self.setModal(True)
 
         self.setStyleSheet("""
             QDialog { background-color: #f4f8ff; border-radius: 14px; }
@@ -509,14 +561,10 @@ class BookmarkDialog(QtWidgets.QDialog):
             QLineEdit, QSpinBox {
                 background: #ffffff; border: 1px solid #a8bfdc; border-radius: 8px;
                 padding: 6px 8px; font-family: 'Times New Roman'; font-size: 12pt; color: #1a1a1a;
-                min-height: 22px;
             }
-            QLineEdit:focus, QSpinBox:focus {
-                border: 2px solid #8b5cf6; background: #fdfefe;
-            }
-            QPushButton {
+            QDialogButtonBox QPushButton {
                 font-family: 'Times New Roman'; font-size: 12pt; font-weight: bold;
-                border-radius: 10px; padding: 8px 18px; min-width: 140px; min-height: 38px;
+                border-radius: 10px; padding: 8px 18px; min-width: 100px;
             }
         """)
 
@@ -530,22 +578,17 @@ class BookmarkDialog(QtWidgets.QDialog):
         """)
 
         self.title_edit = QtWidgets.QLineEdit()
-        self.title_edit.setMinimumWidth(420)
 
         self.level_spin = QtWidgets.QSpinBox()
         self.level_spin.setRange(1, 9)
         self.level_spin.setValue(1)
-        self.level_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.UpDownArrows)
 
         self.page_spin = QtWidgets.QSpinBox()
         self.page_spin.setRange(1, 999999)
         self.page_spin.setValue(page_no)
-        self.page_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.UpDownArrows)
 
         form = QtWidgets.QFormLayout()
-        form.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        form.setFormAlignment(QtCore.Qt.AlignTop)
-        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+        form.setLabelAlignment(QtCore.Qt.AlignRight)
         form.setHorizontalSpacing(18)
         form.setVerticalSpacing(14)
         form.addRow("Bookmark Text", self.title_edit)
@@ -556,29 +599,22 @@ class BookmarkDialog(QtWidgets.QDialog):
         note.setWordWrap(True)
         note.setStyleSheet("QLabel { color: #556b84; font-size: 11pt; font-style: italic; }")
 
-        self.ok_btn = QtWidgets.QPushButton("OK")
-        self.cancel_btn = QtWidgets.QPushButton("Cancel")
-        self.ok_btn.clicked.connect(self.validate_and_accept)
-        self.cancel_btn.clicked.connect(self.reject)
-        self.ok_btn.setStyleSheet("QPushButton { background-color: #55c16d; color: white; } QPushButton:hover { background-color: #73d789; }")
-        self.cancel_btn.setStyleSheet("QPushButton { background-color: #f16a6a; color: white; } QPushButton:hover { background-color: #f48f8f; }")
+        self.buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.validate_and_accept)
+        self.buttons.rejected.connect(self.reject)
 
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_row.addStretch()
-        btn_row.addWidget(self.ok_btn)
-        btn_row.addSpacing(12)
-        btn_row.addWidget(self.cancel_btn)
+        ok_btn = self.buttons.button(QtWidgets.QDialogButtonBox.Ok)
+        cancel_btn = self.buttons.button(QtWidgets.QDialogButtonBox.Cancel)
+        ok_btn.setStyleSheet("QPushButton { background-color: #55c16d; color: white; } QPushButton:hover { background-color: #73d789; }")
+        cancel_btn.setStyleSheet("QPushButton { background-color: #f16a6a; color: white; } QPushButton:hover { background-color: #f48f8f; }")
 
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(12)
-        layout.setSizeConstraint(QtWidgets.QLayout.SetFixedSize)
         layout.addWidget(title_hdr)
-        layout.addSpacing(6)
+        layout.addSpacing(10)
         layout.addLayout(form)
         layout.addWidget(note)
         layout.addSpacing(8)
-        layout.addLayout(btn_row)
+        layout.addWidget(self.buttons)
 
     def validate_and_accept(self):
         if not self.title_edit.text().strip():
@@ -605,23 +641,47 @@ class PdfLabel(QtWidgets.QLabel):
         self.drag_entry_index: Optional[int] = None
         self.drag_offset = QtCore.QPointF(0, 0)
         self.dragging = False
+        self.resize_entry_index: Optional[int] = None
+        self.drag_line_entry_index: Optional[int] = None
+        self.drag_line_mode: Optional[str] = None
+        self.drag_line_kind: Optional[str] = None
+        self.drag_start = QtCore.QPointF(0, 0)
 
     def _get_entry_rect_on_screen(self, entry, color_map):
         page_width = self.main_window.page_rect.width if self.main_window.page_rect else None
         layout = compute_entry_layout(entry, color_map, page_width=page_width)
         rect_pdf = rect_from_top_origin(entry.x1, entry.y1, layout["box_w"], layout["box_h"], entry.pageh)
         zoom = self.main_window.zoom
-        return QtCore.QRectF(
-            rect_pdf.x0 * zoom,
-            rect_pdf.y0 * zoom,
-            rect_pdf.width * zoom,
-            rect_pdf.height * zoom
-        )
+        return QtCore.QRectF(rect_pdf.x0 * zoom, rect_pdf.y0 * zoom, rect_pdf.width * zoom, rect_pdf.height * zoom)
+
+    def _line_handles(self, entry):
+        z = self.main_window.zoom
+        if None in (entry.line_x1, entry.line_y1, entry.line_x2, entry.line_y2):
+            return None
+        p1 = QtCore.QPointF(entry.line_x1 * z, entry.line_y1 * z)
+        p2 = QtCore.QPointF(entry.line_x2 * z, entry.line_y2 * z)
+        return p1, p2
+
+    def _connector_line_points(self, line):
+        z = self.main_window.zoom
+        return QtCore.QPointF(line.x1 * z, line.y1 * z), QtCore.QPointF(line.x2 * z, line.y2 * z)
+
+    def _point_near_line(self, pt, p1, p2, tolerance=7.0):
+        line = QtCore.QLineF(p1, p2)
+        if line.length() == 0:
+            return QtCore.QLineF(pt, p1).length() <= tolerance
+        x0, y0 = pt.x(), pt.y()
+        x1, y1 = p1.x(), p1.y()
+        x2, y2 = p2.x(), p2.y()
+        dx, dy = x2 - x1, y2 - y1
+        t = ((x0 - x1) * dx + (y0 - y1) * dy) / float(dx * dx + dy * dy)
+        t = max(0.0, min(1.0, t))
+        proj = QtCore.QPointF(x1 + t * dx, y1 + t * dy)
+        return QtCore.QLineF(pt, proj).length() <= tolerance
 
     def mousePressEvent(self, event):
         if not self.main_window or not self.main_window.pdf_loaded or self.main_window.page_pixmap is None:
             return
-
         if event.button() != QtCore.Qt.LeftButton:
             return
 
@@ -629,21 +689,91 @@ class PdfLabel(QtWidgets.QLabel):
         color_map = get_page_domain_color_map(self.main_window.entries, current_page)
 
         if self.main_window.active_mode == "annotation":
+            if self.main_window.line_capture_stage is not None:
+                self.last_click_point = event.pos()
+                self.main_window.capture_connector_line_point(event.pos())
+                self.update()
+                return
+
+            for lidx in reversed(range(len(self.main_window.lines))):
+                line = self.main_window.lines[lidx]
+                if line.pageno != current_page:
+                    continue
+                p1, p2 = self._connector_line_points(line)
+                if QtCore.QLineF(event.pos(), p1).length() <= 8:
+                    self.drag_line_entry_index = lidx
+                    self.drag_line_kind = "separate"
+                    self.drag_line_mode = "start"
+                    self.main_window.selected_line_index = lidx
+                    self.main_window.selected_entry_index = -1
+                    self.main_window.refresh_selection_only()
+                    self.update()
+                    return
+                if QtCore.QLineF(event.pos(), p2).length() <= 8:
+                    self.drag_line_entry_index = lidx
+                    self.drag_line_kind = "separate"
+                    self.drag_line_mode = "end"
+                    self.main_window.selected_line_index = lidx
+                    self.main_window.selected_entry_index = -1
+                    self.main_window.refresh_selection_only()
+                    self.update()
+                    return
+                if self._point_near_line(QtCore.QPointF(event.pos()), p1, p2, tolerance=7.0):
+                    self.drag_line_entry_index = lidx
+                    self.drag_line_kind = "separate"
+                    self.drag_line_mode = "whole"
+                    self.drag_start = QtCore.QPointF(event.pos())
+                    self.main_window.selected_line_index = lidx
+                    self.main_window.selected_entry_index = -1
+                    self.main_window.refresh_selection_only()
+                    self.update()
+                    return
+
             for idx in reversed(range(len(self.main_window.entries))):
                 entry = self.main_window.entries[idx]
                 if entry.pageno != current_page:
                     continue
                 rect = self._get_entry_rect_on_screen(entry, color_map)
+                resize_handle = QtCore.QRectF(rect.right() - 12, rect.bottom() - 12, 12, 12)
+                line_pts = self._line_handles(entry)
+                if line_pts and idx == self.main_window.selected_entry_index:
+                    p1, p2 = line_pts
+                    if QtCore.QLineF(event.pos(), p1).length() <= 8:
+                        self.drag_line_entry_index = idx
+                        self.drag_line_kind = "legacy"
+                        self.drag_line_mode = "start"
+                        return
+                    if QtCore.QLineF(event.pos(), p2).length() <= 8:
+                        self.drag_line_entry_index = idx
+                        self.drag_line_kind = "legacy"
+                        self.drag_line_mode = "end"
+                        return
+                    if self._point_near_line(QtCore.QPointF(event.pos()), p1, p2, tolerance=7.0):
+                        self.drag_line_entry_index = idx
+                        self.drag_line_kind = "legacy"
+                        self.drag_line_mode = "whole"
+                        self.drag_start = QtCore.QPointF(event.pos())
+                        self.main_window.selected_entry_index = idx
+                        self.main_window.refresh_selection_only()
+                        self.update()
+                        return
+                if idx == self.main_window.selected_entry_index and resize_handle.contains(QtCore.QPointF(event.pos())):
+                    self.resize_entry_index = idx
+                    self.main_window.selected_entry_index = idx
+                    self.update()
+                    return
                 if rect.contains(event.pos()):
                     self.drag_entry_index = idx
                     self.dragging = True
                     self.drag_offset = QtCore.QPointF(event.pos()) - rect.topLeft()
                     self.main_window.selected_entry_index = idx
+                    self.main_window.selected_line_index = -1
                     self.main_window.refresh_selection_only()
                     self.update()
                     return
 
         self.last_click_point = event.pos()
+        self.main_window.selected_line_index = -1
         self.main_window.store_last_click(event.pos())
         self.update()
 
@@ -653,29 +783,78 @@ class PdfLabel(QtWidgets.QLabel):
             self.main_window.capture_bookmark_point()
 
     def mouseMoveEvent(self, event):
-        if not self.main_window or self.drag_entry_index is None or not self.dragging:
+        if not self.main_window:
             return
-
-        entry = self.main_window.entries[self.drag_entry_index]
-        new_top_left = QtCore.QPointF(event.pos()) - self.drag_offset
-        new_x = max(0.0, new_top_left.x() / self.main_window.zoom)
-        new_y = max(0.0, new_top_left.y() / self.main_window.zoom)
-
-        entry.x1 = round(new_x, 6)
-        entry.y1 = round(new_y, 6)
-
-        self.main_window.refresh_annotation_table()
-        self.main_window.select_annotation_row_silent(self.drag_entry_index)
-        self.update()
+        if self.drag_entry_index is not None and self.dragging:
+            entry = self.main_window.entries[self.drag_entry_index]
+            new_top_left = QtCore.QPointF(event.pos()) - self.drag_offset
+            new_x = max(0.0, new_top_left.x() / self.main_window.zoom)
+            new_y = max(0.0, new_top_left.y() / self.main_window.zoom)
+            entry.x1 = round(new_x, 6)
+            entry.y1 = round(new_y, 6)
+            self.main_window.refresh_annotation_table()
+            self.main_window.select_annotation_row_silent(self.drag_entry_index)
+            self.update()
+            return
+        if self.resize_entry_index is not None:
+            entry = self.main_window.entries[self.resize_entry_index]
+            width = max(MIN_BOX_WIDTH, event.pos().x() / self.main_window.zoom - entry.x1)
+            height = max(BOX_HEIGHT_NORMAL, event.pos().y() / self.main_window.zoom - entry.y1)
+            entry.box_w = round(width, 6)
+            entry.box_h = round(height, 6)
+            self.main_window.refresh_annotation_table()
+            self.main_window.select_annotation_row_silent(self.resize_entry_index)
+            self.update()
+            return
+        if self.drag_line_entry_index is not None:
+            x = max(0.0, event.pos().x() / self.main_window.zoom)
+            y = max(0.0, event.pos().y() / self.main_window.zoom)
+            if self.drag_line_kind == "separate":
+                line = self.main_window.lines[self.drag_line_entry_index]
+                if self.drag_line_mode == "start":
+                    line.x1 = round(x, 6)
+                    line.y1 = round(y, 6)
+                elif self.drag_line_mode == "end":
+                    line.x2 = round(x, 6)
+                    line.y2 = round(y, 6)
+                elif self.drag_line_mode == "whole":
+                    dx = (event.pos().x() - self.drag_start.x()) / self.main_window.zoom
+                    dy = (event.pos().y() - self.drag_start.y()) / self.main_window.zoom
+                    line.x1 = round(line.x1 + dx, 6)
+                    line.y1 = round(line.y1 + dy, 6)
+                    line.x2 = round(line.x2 + dx, 6)
+                    line.y2 = round(line.y2 + dy, 6)
+                    self.drag_start = QtCore.QPointF(event.pos())
+            else:
+                entry = self.main_window.entries[self.drag_line_entry_index]
+                if self.drag_line_mode == "start":
+                    entry.line_x1 = round(x, 6)
+                    entry.line_y1 = round(y, 6)
+                elif self.drag_line_mode == "end":
+                    entry.line_x2 = round(x, 6)
+                    entry.line_y2 = round(y, 6)
+                elif self.drag_line_mode == "whole":
+                    dx = (event.pos().x() - self.drag_start.x()) / self.main_window.zoom
+                    dy = (event.pos().y() - self.drag_start.y()) / self.main_window.zoom
+                    entry.line_x1 = round((entry.line_x1 or 0) + dx, 6)
+                    entry.line_y1 = round((entry.line_y1 or 0) + dy, 6)
+                    entry.line_x2 = round((entry.line_x2 or 0) + dx, 6)
+                    entry.line_y2 = round((entry.line_y2 or 0) + dy, 6)
+                    self.drag_start = QtCore.QPointF(event.pos())
+            self.update()
+            return
 
     def mouseReleaseEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton:
             self.drag_entry_index = None
             self.dragging = False
+            self.resize_entry_index = None
+            self.drag_line_entry_index = None
+            self.drag_line_mode = None
+            self.drag_line_kind = None
 
     def paintEvent(self, event):
         super().paintEvent(event)
-
         if not self.main_window or self.main_window.page_rect is None:
             return
 
@@ -685,25 +864,44 @@ class PdfLabel(QtWidgets.QLabel):
         color_map = get_page_domain_color_map(self.main_window.entries, current_page)
         page_width = self.main_window.page_rect.width if self.main_window.page_rect else None
 
-        # Annotation previews
+        for lidx, line in enumerate(self.main_window.lines):
+            if line.pageno != current_page:
+                continue
+            line_pen = QtGui.QPen(QtGui.QColor("#c62828"), 2)
+            painter.setPen(line_pen)
+            p1, p2 = self._connector_line_points(line)
+            painter.drawLine(p1, p2)
+            if lidx == self.main_window.selected_line_index:
+                painter.setBrush(QtGui.QBrush(QtGui.QColor("#c62828")))
+                painter.setPen(QtGui.QPen(QtGui.QColor("#7f1d1d"), 1))
+                painter.drawEllipse(p1, 5, 5)
+                painter.drawEllipse(p2, 5, 5)
+
         for idx, entry in enumerate(self.main_window.entries):
             if entry.pageno != current_page:
                 continue
 
             layout = compute_entry_layout(entry, color_map, page_width=page_width)
             rect_pdf = rect_from_top_origin(entry.x1, entry.y1, layout["box_w"], layout["box_h"], entry.pageh)
-            rect = QtCore.QRectF(
-                rect_pdf.x0 * zoom,
-                rect_pdf.y0 * zoom,
-                rect_pdf.width * zoom,
-                rect_pdf.height * zoom
-            )
+            rect = QtCore.QRectF(rect_pdf.x0 * zoom, rect_pdf.y0 * zoom, rect_pdf.width * zoom, rect_pdf.height * zoom)
+
+            if None not in (entry.line_x1, entry.line_y1, entry.line_x2, entry.line_y2):
+                line_pen = QtGui.QPen(QtGui.QColor("#c62828"), 2)
+                painter.setPen(line_pen)
+                p1 = QtCore.QPointF(entry.line_x1 * zoom, entry.line_y1 * zoom)
+                p2 = QtCore.QPointF(entry.line_x2 * zoom, entry.line_y2 * zoom)
+                painter.drawLine(p1, p2)
+                if idx == self.main_window.selected_entry_index:
+                    painter.setBrush(QtGui.QBrush(QtGui.QColor("#c62828")))
+                    painter.setPen(QtGui.QPen(QtGui.QColor("#7f1d1d"), 1))
+                    painter.drawEllipse(p1, 5, 5)
+                    painter.drawEllipse(p2, 5, 5)
 
             fill_q = qcolor_from_rgb01(layout["fill"])
             fill_q.setAlpha(210)
             painter.fillRect(rect, fill_q)
 
-            pen = QtGui.QPen(QtGui.QColor(0, 0, 0), 1)
+            pen = QtGui.QPen(QtGui.QColor(60, 72, 88), 1)
             if layout["dashed"]:
                 pen.setStyle(QtCore.Qt.DashLine)
             painter.setPen(pen)
@@ -716,17 +914,23 @@ class PdfLabel(QtWidgets.QLabel):
             painter.setPen(QtGui.QColor(0, 0, 0))
 
             line_gap = (layout["font_size"] + 1.2) * zoom * 0.75
-            tx = rect.left() + TEXT_PADDING_X * zoom
             ty = rect.top() + (layout["font_size"] + TEXT_PADDING_Y) * zoom * 0.75
-
             for line in layout["lines"]:
-                painter.drawText(QtCore.QPointF(tx, ty), line)
+                line_indent = max(0.0, estimate_text_width(line) - estimate_text_width(line.lstrip(" "))) * zoom * 0.75
+                tx = rect.left() + TEXT_PADDING_X * zoom + line_indent
+                painter.drawText(QtCore.QPointF(tx, ty), line.lstrip(" "))
                 ty += line_gap
 
             mx = entry.x1 * zoom
             my = entry.y1 * zoom
             if idx == self.main_window.selected_entry_index:
-                sel_pen = QtGui.QPen(QtGui.QColor("#ff00aa"), 3)
+                sel_pen = QtGui.QPen(QtGui.QColor("#7c3aed"), 3)
+                painter.setPen(sel_pen)
+                painter.setBrush(QtCore.Qt.NoBrush)
+                painter.drawRect(rect.adjusted(-2, -2, 2, 2))
+                painter.setBrush(QtGui.QBrush(QtGui.QColor("#facc15")))
+                painter.setPen(QtGui.QPen(QtGui.QColor("#854d0e"), 1))
+                painter.drawRect(QtCore.QRectF(rect.right() - 12, rect.bottom() - 12, 12, 12))
                 painter.setPen(sel_pen)
                 painter.drawEllipse(QtCore.QPointF(mx, my), 6, 6)
             else:
@@ -735,34 +939,25 @@ class PdfLabel(QtWidgets.QLabel):
                 painter.setBrush(QtGui.QBrush(QtGui.QColor("#7fc2ff")))
                 painter.drawEllipse(QtCore.QPointF(mx, my), 4, 4)
 
-        # Bookmark preview by page only
         bookmark_pen = QtGui.QPen(BOOKMARK_PREVIEW_COLOR, 2)
         bookmark_pen.setStyle(QtCore.Qt.DashLine)
         painter.setPen(bookmark_pen)
-
         y_base = 28
         y_gap = 18
         page_bookmarks = [b for b in self.main_window.bookmarks if b.pageno == current_page]
-
         for idx, bm in enumerate(page_bookmarks):
             sy = y_base + idx * y_gap
             painter.drawLine(0, sy, min(self.width(), 320), sy)
-
             text_pen = QtGui.QPen(BOOKMARK_PREVIEW_TEXT_COLOR, 1)
             painter.setPen(text_pen)
             f = QtGui.QFont("Arial", 9)
-            is_selected = (
-                0 <= self.main_window.selected_bookmark_index < len(self.main_window.bookmarks)
-                and self.main_window.bookmarks[self.main_window.selected_bookmark_index] == bm
-            )
+            is_selected = (0 <= self.main_window.selected_bookmark_index < len(self.main_window.bookmarks) and self.main_window.bookmarks[self.main_window.selected_bookmark_index] == bm)
             f.setBold(is_selected)
             painter.setFont(f)
-
             offset_x = 8 + (max(1, bm.level) - 1) * 12
             painter.drawText(QtCore.QPointF(offset_x, sy - 4), f"BM L{bm.level}: {bm.title[:45]}")
             painter.setPen(bookmark_pen)
 
-        # Last click crosshair
         if self.last_click_point and self.main_window.active_mode in ("annotation", "bookmark"):
             pen = QtGui.QPen(QtGui.QColor("#ff3b30"), 2)
             painter.setPen(pen)
@@ -794,9 +989,11 @@ class AnnotatorApp(QtWidgets.QWidget):
 
         self.entries: List[AnnotationEntry] = []
         self.bookmarks: List[BookmarkEntry] = []
+        self.lines: List[ConnectorLineEntry] = []
 
         self.selected_entry_index = -1
         self.selected_bookmark_index = -1
+        self.selected_line_index = -1
 
         self.last_click_pdf_x = None
         self.last_click_pdf_y = None
@@ -809,6 +1006,8 @@ class AnnotatorApp(QtWidgets.QWidget):
 
         self._suppress_annotation_selection_signal = False
         self._suppress_bookmark_selection_signal = False
+        self.line_capture_stage = None
+        self.pending_line_start = None
 
         self.build_ui()
 
@@ -888,8 +1087,8 @@ class AnnotatorApp(QtWidgets.QWidget):
         top_row.setSpacing(8)
 
         self.btn_open = mkbtn("Open PDF", "#3b82f6", "#5c9cff")
-        self.btn_prev = mkbtn("Previous Page", "#b9b9b9", "#d0d0d0", "#333")
-        self.btn_next = mkbtn("Next Page", "#ad7dfc", "#c7a2fd")
+        self.btn_prev = mkbtn("Previous Page", "#9ca3af", "#b6bcc7", "#1f2937")
+        self.btn_next = mkbtn("Next Page", "#6b7280", "#7b8495")
 
         self.btn_prev.setEnabled(False)
         self.btn_next.setEnabled(False)
@@ -902,10 +1101,13 @@ class AnnotatorApp(QtWidgets.QWidget):
             }
         """)
 
+        self.btn_terminate = mkbtn("Terminate", "#991b1b", "#b91c1c")
+
         top_row.addWidget(self.btn_open)
         top_row.addWidget(self.btn_prev)
         top_row.addWidget(self.btn_next)
         top_row.addStretch()
+        top_row.addWidget(self.btn_terminate)
         top_row.addWidget(self.page_info)
         layout.addLayout(top_row)
 
@@ -1015,10 +1217,14 @@ class AnnotatorApp(QtWidgets.QWidget):
 
         self.btn_export_ann = mkbtn("Export Annotation CSV", "#2563eb", "#4a7df2")
         self.btn_load_ann = mkbtn("Load Annotation CSV", "#7c3aed", "#9b63f0")
+        self.btn_line_mode = mkbtn("Draw Connector Line", "#b45309", "#c97519")
+        self.btn_clear_line = mkbtn("Clear Connector Line", "#475569", "#64748b")
         self.btn_delete_ann = mkbtn("Delete Selected Annotation", "#ef4444", "#f87171")
 
         ann_btn_row.addWidget(self.btn_export_ann)
         ann_btn_row.addWidget(self.btn_load_ann)
+        ann_btn_row.addWidget(self.btn_line_mode)
+        ann_btn_row.addWidget(self.btn_clear_line)
         ann_btn_row.addStretch()
         ann_btn_row.addWidget(self.btn_delete_ann)
 
@@ -1165,6 +1371,7 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.btn_open.clicked.connect(self.open_pdf)
         self.btn_prev.clicked.connect(self.prev_page)
         self.btn_next.clicked.connect(self.next_page)
+        self.btn_terminate.clicked.connect(self.close)
 
         self.btn_annotation.clicked.connect(lambda: self.switch_mode("annotation"))
         self.btn_bookmark.clicked.connect(lambda: self.switch_mode("bookmark"))
@@ -1181,12 +1388,15 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.btn_export_ann.clicked.connect(self.export_annotations_csv)
         self.btn_load_ann.clicked.connect(self.load_annotations_csv)
         self.btn_delete_ann.clicked.connect(self.delete_selected_annotation)
+        self.btn_line_mode.clicked.connect(self.start_connector_line_mode)
+        self.btn_clear_line.clicked.connect(self.clear_connector_lines)
 
         self.btn_export_bm.clicked.connect(self.export_bookmarks_csv)
         self.btn_load_bm.clicked.connect(self.load_bookmarks_csv)
         self.btn_delete_bm.clicked.connect(self.delete_selected_bookmark)
 
         self.switch_mode("annotation", force=True)
+        self.update_annotation_action_buttons()
 
     def init_splitter_sizes(self):
         total = max(self.height() - 200, 700)
@@ -1210,7 +1420,7 @@ class AnnotatorApp(QtWidgets.QWidget):
                         border-radius: 10px;
                         padding: 6px 14px;
                         min-height: 34px;
-                        border: 3px solid #111827;
+                        border: 3px solid #d1fae5;
                     }}
                     QPushButton:hover:!disabled {{
                         background-color: {hover};
@@ -1244,21 +1454,23 @@ class AnnotatorApp(QtWidgets.QWidget):
                     }}
                 """)
 
-        style_button(self.btn_annotation, "#2563eb", "#4a7df2", self.active_mode == "annotation")
-        style_button(self.btn_bookmark, "#7c3aed", "#9b63f0", self.active_mode == "bookmark")
-        style_button(self.btn_review, "#059669", "#21b58a", self.active_mode == "review")
+        style_button(self.btn_annotation, "#315c8f", "#4270a7", self.active_mode == "annotation")
+        style_button(self.btn_bookmark, "#6b4f8f", "#7c61a0", self.active_mode == "bookmark")
+        style_button(self.btn_review, "#3f7d68", "#548f7b", self.active_mode == "review")
 
     def switch_mode(self, mode, force=False):
         if not force and mode in ("annotation", "bookmark", "review") and not self.pdf_loaded and mode != "annotation":
             return
 
         self.active_mode = mode
+        if mode != "annotation":
+            self.reset_line_capture_state()
         self.set_active_mode_button_styles()
 
         if mode == "annotation":
             self.main_stack.setCurrentIndex(0)
             self.bottom_stack.setCurrentIndex(0)
-            self.tip.setText("Click anywhere on the PDF to add annotation. Drag an existing box to reposition it.")
+            self.tip.setText("Click anywhere on the PDF to add annotation. Drag box, resize from bottom-right handle, or add/edit a connector line for the selected annotation.")
             QtCore.QTimer.singleShot(0, lambda: self.splitter.setSizes([int(max(self.height() - 200, 700) * 0.82), int(max(self.height() - 200, 700) * 0.18)]))
         elif mode == "bookmark":
             self.main_stack.setCurrentIndex(0)
@@ -1297,8 +1509,10 @@ class AnnotatorApp(QtWidgets.QWidget):
             self.current_page_index = 0
             self.entries = []
             self.bookmarks = []
+            self.lines = []
             self.selected_entry_index = -1
             self.selected_bookmark_index = -1
+            self.selected_line_index = -1
             self.image_label.last_click_point = None
             self.last_click_pdf_x = None
             self.last_click_pdf_y = None
@@ -1310,6 +1524,8 @@ class AnnotatorApp(QtWidgets.QWidget):
 
             self.btn_annotation.setEnabled(True)
             self.btn_bookmark.setEnabled(True)
+            self.btn_line_mode.setEnabled(False)
+            self.btn_clear_line.setEnabled(False)
             self.check_review_enable()
 
             self.refresh_annotation_table()
@@ -1317,6 +1533,7 @@ class AnnotatorApp(QtWidgets.QWidget):
             self.refresh_review_tables()
             self.render_page()
             self.switch_mode("annotation")
+            self.update_annotation_action_buttons()
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Error", f"Unable to open PDF:\n{e}")
 
@@ -1385,7 +1602,13 @@ class AnnotatorApp(QtWidgets.QWidget):
             pageh=round(pageh, 6),
             is_domain_annotation=vals["is_domain_annotation"],
             is_assigned_field=vals["is_assigned_field"],
-            is_not_submitted=vals["is_not_submitted"]
+            is_not_submitted=vals["is_not_submitted"],
+            box_w=None,
+            box_h=None,
+            line_x1=None,
+            line_y1=None,
+            line_x2=None,
+            line_y2=None
         )
 
         self.entries.append(entry)
@@ -1471,6 +1694,7 @@ class AnnotatorApp(QtWidgets.QWidget):
     def refresh_selection_only(self):
         if self.selected_entry_index >= 0:
             self.select_annotation_row_silent(self.selected_entry_index)
+        self.update_annotation_action_buttons()
 
     def on_annotation_selection_changed(self):
         if self._suppress_annotation_selection_signal:
@@ -1479,6 +1703,7 @@ class AnnotatorApp(QtWidgets.QWidget):
         row = self.annotation_table.currentRow()
         if 0 <= row < len(self.entries):
             self.selected_entry_index = row
+            self.selected_line_index = -1
             entry = self.entries[row]
             target_page_index = entry.pageno - 1
             if self.doc and target_page_index != self.current_page_index:
@@ -1486,16 +1711,86 @@ class AnnotatorApp(QtWidgets.QWidget):
                 self.render_page()
         else:
             self.selected_entry_index = -1
+        self.update_annotation_action_buttons()
         self.image_label.update()
 
     def on_review_annotation_selection_changed(self):
         row = self.review_annotation_table.currentRow()
         if 0 <= row < len(self.entries):
             self.selected_entry_index = row
+            self.selected_line_index = -1
             entry = self.entries[row]
             if self.doc:
                 self.current_page_index = max(0, entry.pageno - 1)
                 self.render_page()
+
+    def update_annotation_action_buttons(self):
+        self.btn_line_mode.setEnabled(bool(self.pdf_loaded))
+        self.btn_clear_line.setEnabled(bool(self.pdf_loaded and (self.lines or self.selected_line_index >= 0)))
+
+    def reset_line_capture_state(self):
+        self.line_capture_stage = None
+        self.pending_line_start = None
+
+    def start_connector_line_mode(self):
+        if not self.pdf_loaded or not self.doc:
+            QtWidgets.QMessageBox.information(self, "Connector Line", "Please open the source PDF first.")
+            return
+        self.selected_entry_index = -1
+        self.selected_line_index = -1
+        self.line_capture_stage = "start"
+        self.pending_line_start = None
+        self.tip.setText("Connector line mode: click START point and then END point on the PDF.")
+        self.refresh_selection_only()
+        self.image_label.update()
+
+    def clear_connector_lines(self):
+        if 0 <= self.selected_line_index < len(self.lines):
+            del self.lines[self.selected_line_index]
+            self.selected_line_index = -1
+        elif self.lines:
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "Clear Connector Lines",
+                "No line is selected. Do you want to clear all connector lines?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
+            self.lines = []
+        else:
+            QtWidgets.QMessageBox.information(self, "Connector Line", "No connector lines available to clear.")
+            return
+        self.reset_line_capture_state()
+        self.update_annotation_action_buttons()
+        self.image_label.update()
+
+    def capture_connector_line_point(self, point: QtCore.QPoint):
+        if self.line_capture_stage is None:
+            return
+        x = max(0, min(point.x() / self.zoom, self.page_rect.width))
+        y = max(0, min(point.y() / self.zoom, self.page_rect.height))
+        if self.line_capture_stage == "start":
+            self.pending_line_start = (round(x, 6), round(y, 6))
+            self.line_capture_stage = "end"
+            self.tip.setText("Connector line mode: click END point on the PDF.")
+        else:
+            sx, sy = self.pending_line_start or (round(x, 6), round(y, 6))
+            self.lines.append(
+                ConnectorLineEntry(
+                    pageno=self.current_page_index + 1,
+                    x1=sx,
+                    y1=sy,
+                    x2=round(x, 6),
+                    y2=round(y, 6),
+                )
+            )
+            self.selected_line_index = len(self.lines) - 1
+            self.reset_line_capture_state()
+            self.tip.setText("Click anywhere on the PDF to add annotation or bookmark, based on the selected mode.")
+            self.update_annotation_action_buttons()
+        self.image_label.update()
 
     # ------------------------------------------------------------------
     # Bookmark table
@@ -1594,6 +1889,7 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.refresh_annotation_table()
         self.refresh_review_tables()
         self.image_label.update()
+        self.update_annotation_action_buttons()
 
         self.has_annotation = len(self.entries) > 0
         self.check_review_enable()
@@ -1643,10 +1939,11 @@ class AnnotatorApp(QtWidgets.QWidget):
 
         try:
             with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.DictWriter(f, fieldnames=ANNOTATION_CSV_COLUMNS)
+                writer = csv.DictWriter(f, fieldnames=ANNOTATION_CSV_COLUMNS, quoting=csv.QUOTE_ALL)
                 writer.writeheader()
                 for e in self.entries:
                     writer.writerow({
+                        "TYPE": "ANNOTATION",
                         "DOMAIN": e.domain,
                         "NAME": e.name,
                         "PAGENO": e.pageno,
@@ -1655,6 +1952,32 @@ class AnnotatorApp(QtWidgets.QWidget):
                         "X1": e.x1,
                         "Y1": e.y1,
                         "PAGEH": e.pageh,
+                        "BOX_W": "" if e.box_w is None else e.box_w,
+                        "BOX_H": "" if e.box_h is None else e.box_h,
+                        "LINE_PAGENO": "",
+                        "LINE_X1": "" if e.line_x1 is None else e.line_x1,
+                        "LINE_Y1": "" if e.line_y1 is None else e.line_y1,
+                        "LINE_X2": "" if e.line_x2 is None else e.line_x2,
+                        "LINE_Y2": "" if e.line_y2 is None else e.line_y2,
+                    })
+                for ln in self.lines:
+                    writer.writerow({
+                        "TYPE": "LINE",
+                        "DOMAIN": "",
+                        "NAME": "",
+                        "PAGENO": "",
+                        "ANNOTATION": "",
+                        "ASSIGNEDFIELD": "",
+                        "X1": "",
+                        "Y1": "",
+                        "PAGEH": "",
+                        "BOX_W": "",
+                        "BOX_H": "",
+                        "LINE_PAGENO": ln.pageno,
+                        "LINE_X1": ln.x1,
+                        "LINE_Y1": ln.y1,
+                        "LINE_X2": ln.x2,
+                        "LINE_Y2": ln.y2,
                     })
             QtWidgets.QMessageBox.information(self, "Export Annotation CSV", f"Annotation CSV exported successfully:\n{out_path}")
         except Exception as e:
@@ -1687,12 +2010,18 @@ class AnnotatorApp(QtWidgets.QWidget):
                 for row in reader:
                     domain = (row.get("DOMAIN") or "").strip()
                     name = (row.get("NAME") or "").strip()
-                    annotation = (row.get("ANNOTATION") or "").strip()
+                    annotation = (row.get("ANNOTATION") or "").replace("\t", "    ").rstrip()
                     assignedfield = (row.get("ASSIGNEDFIELD") or "").strip()
-                    pageno = int(float(row.get("PAGENO") or 0))
-                    x1 = float(row.get("X1") or 0)
-                    y1 = float(row.get("Y1") or 0)
-                    pageh = float(row.get("PAGEH") or (self.page_rect.height if self.page_rect else 0))
+                    pageno = int(clean_number(row.get("PAGENO"), 0) or 0)
+                    x1 = clean_number(row.get("X1"), 0) or 0
+                    y1 = clean_number(row.get("Y1"), 0) or 0
+                    pageh = clean_number(row.get("PAGEH"), (self.page_rect.height if self.page_rect else 0)) or 0
+                    box_w = clean_number(row.get("BOX_W"), None)
+                    box_h = clean_number(row.get("BOX_H"), None)
+                    line_x1 = clean_number(row.get("LINE_X1"), None)
+                    line_y1 = clean_number(row.get("LINE_Y1"), None)
+                    line_x2 = clean_number(row.get("LINE_X2"), None)
+                    line_y2 = clean_number(row.get("LINE_Y2"), None)
 
                     is_domain_annotation, is_assigned_field, is_not_submitted = bool_from_entry(
                         domain, name, annotation, assignedfield
@@ -1710,12 +2039,27 @@ class AnnotatorApp(QtWidgets.QWidget):
                             pageh=pageh,
                             is_domain_annotation=is_domain_annotation,
                             is_assigned_field=is_assigned_field,
-                            is_not_submitted=is_not_submitted
+                            is_not_submitted=is_not_submitted,
+                            box_w=box_w,
+                            box_h=box_h,
+                            line_x1=line_x1,
+                            line_y1=line_y1,
+                            line_x2=line_x2,
+                            line_y2=line_y2
                         )
                     )
 
             self.entries = loaded_entries
+            self.lines = loaded_lines
+            for e in self.entries:
+                if None not in (e.line_x1, e.line_y1, e.line_x2, e.line_y2):
+                    self.lines.append(ConnectorLineEntry(pageno=e.pageno, x1=e.line_x1, y1=e.line_y1, x2=e.line_x2, y2=e.line_y2))
+                    e.line_x1 = None
+                    e.line_y1 = None
+                    e.line_x2 = None
+                    e.line_y2 = None
             self.selected_entry_index = -1
+            self.selected_line_index = -1
             self.refresh_annotation_table()
             self.refresh_review_tables()
             self.image_label.update()
@@ -1784,8 +2128,8 @@ class AnnotatorApp(QtWidgets.QWidget):
                     title = (row.get("TITLE") or "").strip()
                     if not title:
                         continue
-                    level = int(float(row.get("LEVEL") or 1))
-                    pageno = int(float(row.get("PAGENO") or 1))
+                    level = int(clean_number(row.get("LEVEL"), 1) or 1)
+                    pageno = int(clean_number(row.get("PAGENO"), 1) or 1)
 
                     loaded_bookmarks.append(
                         BookmarkEntry(
@@ -1861,6 +2205,28 @@ class AnnotatorApp(QtWidgets.QWidget):
                         bold=layout["bold"],
                         dashed=layout["dashed"],
                         font_size=layout["font_size"]
+                    )
+
+                    if None not in (e.line_x1, e.line_y1, e.line_x2, e.line_y2):
+                        page.draw_line(
+                            fitz.Point(e.line_x1, e.line_y1),
+                            fitz.Point(e.line_x2, e.line_y2),
+                            color=(1, 0, 0),
+                            width=1.2,
+                            overlay=True
+                        )
+
+            if self.lines:
+                for ln in self.lines:
+                    if ln.pageno < 1 or ln.pageno > len(doc):
+                        continue
+                    page = doc[ln.pageno - 1]
+                    page.draw_line(
+                        fitz.Point(ln.x1, ln.y1),
+                        fitz.Point(ln.x2, ln.y2),
+                        color=(1, 0, 0),
+                        width=1.2,
+                        overlay=True
                     )
 
             if self.bookmarks:
