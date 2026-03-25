@@ -30,7 +30,6 @@
 import csv
 import importlib
 import os
-import site
 import subprocess
 import sys
 from collections import OrderedDict
@@ -39,25 +38,26 @@ from typing import List, Optional
 
 # ================================
 # Auto-install required packages
+# Works on Windows and macOS
 # ================================
-def ensure_user_site():
-    user_site = site.getusersitepackages()
-    if user_site not in sys.path:
-        sys.path.insert(0, user_site)
-
+REQUIRED_PACKAGES = [
+    ("PyMuPDF", "fitz"),
+    ("PyQt5", "PyQt5"),
+]
 
 def install_if_missing(package_name, import_name=None):
+    module_name = import_name or package_name
     try:
-        importlib.import_module(import_name or package_name)
+        importlib.import_module(module_name)
     except ImportError:
-        print(f"[Installing] {package_name} (user mode)...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", package_name])
+        print(f"[Installing] {package_name} ...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
+        importlib.invalidate_caches()
+        importlib.import_module(module_name)
         print(f"[Done] {package_name} installed.")
 
-
-ensure_user_site()
-install_if_missing("PyMuPDF", "fitz")
-install_if_missing("PyQt5")
+for package_name, import_name in REQUIRED_PACKAGES:
+    install_if_missing(package_name, import_name)
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
