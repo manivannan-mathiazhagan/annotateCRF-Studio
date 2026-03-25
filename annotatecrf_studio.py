@@ -20,6 +20,8 @@
 #
 #                  Annotation CSV columns used internally:
 #                    DOMAIN,NAME,PAGENO,ANNOTATION,ASSIGNEDFIELD,X1,Y1,PAGEH
+#                    X1/Y1/PAGEH may be left blank during import; the tool will place the
+#                    annotation at a default location and it can then be dragged manually.
 #
 #                  Bookmark CSV columns used internally:
 #                    TITLE,LEVEL,PAGENO
@@ -1983,6 +1985,40 @@ class AnnotatorApp(QtWidgets.QWidget):
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Export Annotation CSV", f"Failed to export annotation CSV:\n{e}")
 
+    def get_pdf_page_rect(self, pageno: int):
+        if not self.doc or pageno < 1 or pageno > len(self.doc):
+            return None
+        try:
+            return self.doc[pageno - 1].rect
+        except Exception:
+            return None
+
+    def get_default_annotation_position(self, pageno: int, loaded_entries=None):
+        """
+        Return a default (x1, y1, pageh) for imported annotations that do not
+        provide coordinates. Stacks boxes vertically on the page so that they
+        can be reviewed and dragged later.
+        """
+        rect = self.get_pdf_page_rect(pageno)
+        if rect is None:
+            pagew = 595.0
+            pageh = 842.0
+        else:
+            pagew = float(rect.width)
+            pageh = float(rect.height)
+
+        existing = loaded_entries if loaded_entries is not None else self.entries
+        same_page_count = sum(1 for e in existing if e.pageno == pageno)
+
+        default_x = min(36.0, max(12.0, pagew - 140.0))
+        default_y = 36.0 + (same_page_count * 26.0)
+
+        max_y = max(12.0, pageh - 80.0)
+        if default_y > max_y:
+            default_y = 36.0 + ((same_page_count % 10) * 26.0)
+
+        return round(default_x, 6), round(default_y, 6), round(pageh, 6)
+
     def load_annotations_csv(self):
         if not self.doc:
             QtWidgets.QMessageBox.warning(self, "Load Annotation CSV", "Please open the source PDF first.")
@@ -1996,32 +2032,90 @@ class AnnotatorApp(QtWidgets.QWidget):
 
         try:
             loaded_entries = []
+            loaded_lines = []
+            missing_position_count = 0
+
             with open(in_path, "r", newline="", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
-                expected = set(ANNOTATION_CSV_COLUMNS)
                 actual = set([c.strip().upper() for c in (reader.fieldnames or [])])
 
-                if not expected.issubset(actual):
+                required_min = {"DOMAIN", "NAME", "ANNOTATION"}
+                missing = required_min - actual
+                if missing:
                     raise ValueError(
                         "Annotation CSV is missing required columns.\n"
-                        f"Required: {', '.join(ANNOTATION_CSV_COLUMNS)}"
+                        f"Minimum required: {', '.join(sorted(required_min))}\n"
+                        f"Missing: {', '.join(sorted(missing))}"
                     )
 
                 for row in reader:
+                    row_type = (row.get("TYPE") or "ANNOTATION").strip().upper()
+
+                    if row_type == "LINE":
+                        line_pageno = int(clean_number(row.get("LINE_PAGENO"), 0) or 0)
+                        line_x1 = clean_number(row.get("LINE_X1"), None)
+                        line_y1 = clean_number(row.get("LINE_Y1"), None)
+                        line_x2 = clean_number(row.get("LINE_X2"), None)
+                        line_y2 = clean_number(row.get("LINE_Y2"), None)
+
+                        if (
+                            line_pageno >= 1 and
+                            None not in (line_x1, line_y1, line_x2, line_y2)
+                        ):
+                            loaded_lines.append(
+                                ConnectorLineEntry(
+                                    pageno=line_pageno,
+                                    x1=line_x1,
+                                    y1=line_y1,
+                                    x2=line_x2,
+                                    y2=line_y2
+                                )
+                            )
+                        continue
+
                     domain = (row.get("DOMAIN") or "").strip()
                     name = (row.get("NAME") or "").strip()
                     annotation = (row.get("ANNOTATION") or "").replace("\t", "    ").rstrip()
                     assignedfield = (row.get("ASSIGNEDFIELD") or "").strip()
+
+                    if not domain and not name and not annotation:
+                        continue
+
                     pageno = int(clean_number(row.get("PAGENO"), 0) or 0)
-                    x1 = clean_number(row.get("X1"), 0) or 0
-                    y1 = clean_number(row.get("Y1"), 0) or 0
-                    pageh = clean_number(row.get("PAGEH"), (self.page_rect.height if self.page_rect else 0)) or 0
+                    if pageno < 1:
+                        pageno = self.current_page_index + 1
+                    elif self.doc and pageno > len(self.doc):
+                        pageno = len(self.doc)
+
+                    raw_x1 = clean_number(row.get("X1"), None)
+                    raw_y1 = clean_number(row.get("Y1"), None)
+                    raw_pageh = clean_number(row.get("PAGEH"), None)
+
                     box_w = clean_number(row.get("BOX_W"), None)
                     box_h = clean_number(row.get("BOX_H"), None)
+
                     line_x1 = clean_number(row.get("LINE_X1"), None)
                     line_y1 = clean_number(row.get("LINE_Y1"), None)
                     line_x2 = clean_number(row.get("LINE_X2"), None)
                     line_y2 = clean_number(row.get("LINE_Y2"), None)
+
+                    if raw_x1 is None or raw_y1 is None or raw_pageh is None:
+                        x1, y1, pageh = self.get_default_annotation_position(
+                            pageno, loaded_entries=loaded_entries
+                        )
+                        missing_position_count += 1
+                    else:
+                        rect = self.get_pdf_page_rect(pageno)
+                        if rect is None:
+                            pagew = 595.0
+                            pageh_actual = raw_pageh
+                        else:
+                            pagew = float(rect.width)
+                            pageh_actual = float(rect.height)
+
+                        x1 = max(0.0, min(float(raw_x1), max(0.0, pagew - 20.0)))
+                        y1 = max(0.0, min(float(raw_y1), max(0.0, pageh_actual - 20.0)))
+                        pageh = float(raw_pageh) if raw_pageh is not None else pageh_actual
 
                     is_domain_annotation, is_assigned_field, is_not_submitted = bool_from_entry(
                         domain, name, annotation, assignedfield
@@ -2034,9 +2128,9 @@ class AnnotatorApp(QtWidgets.QWidget):
                             pageno=pageno,
                             annotation=annotation,
                             assignedfield=assignedfield,
-                            x1=x1,
-                            y1=y1,
-                            pageh=pageh,
+                            x1=round(x1, 6),
+                            y1=round(y1, 6),
+                            pageh=round(pageh, 6),
                             is_domain_annotation=is_domain_annotation,
                             is_assigned_field=is_assigned_field,
                             is_not_submitted=is_not_submitted,
@@ -2051,13 +2145,23 @@ class AnnotatorApp(QtWidgets.QWidget):
 
             self.entries = loaded_entries
             self.lines = loaded_lines
+
             for e in self.entries:
                 if None not in (e.line_x1, e.line_y1, e.line_x2, e.line_y2):
-                    self.lines.append(ConnectorLineEntry(pageno=e.pageno, x1=e.line_x1, y1=e.line_y1, x2=e.line_x2, y2=e.line_y2))
+                    self.lines.append(
+                        ConnectorLineEntry(
+                            pageno=e.pageno,
+                            x1=e.line_x1,
+                            y1=e.line_y1,
+                            x2=e.line_x2,
+                            y2=e.line_y2
+                        )
+                    )
                     e.line_x1 = None
                     e.line_y1 = None
                     e.line_x2 = None
                     e.line_y2 = None
+
             self.selected_entry_index = -1
             self.selected_line_index = -1
             self.refresh_annotation_table()
@@ -2067,7 +2171,11 @@ class AnnotatorApp(QtWidgets.QWidget):
             self.has_annotation = len(self.entries) > 0
             self.check_review_enable()
 
-            QtWidgets.QMessageBox.information(self, "Load Annotation CSV", f"Loaded {len(self.entries)} annotation row(s).")
+            msg = f"Loaded {len(self.entries)} annotation row(s)."
+            if missing_position_count:
+                msg += f"\n\n{missing_position_count} row(s) had blank position values and were placed at default locations. You can drag them after loading."
+            QtWidgets.QMessageBox.information(self, "Load Annotation CSV", msg)
+
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Load Annotation CSV", f"Failed to load annotation CSV:\n{e}")
 
