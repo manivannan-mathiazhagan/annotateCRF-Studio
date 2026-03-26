@@ -30,6 +30,7 @@
 import csv
 import importlib
 import os
+import re
 import subprocess
 import sys
 from collections import OrderedDict
@@ -272,6 +273,38 @@ def compute_entry_layout(entry, color_map, page_width=None):
     }
 
 
+
+def extract_page_reference(text: str):
+    if not text:
+        return None
+    m = re.search(r'\b(?:for\s+annotations\s+)?(?:refer\s+to|see)?\s*page\s+(\d+)\b', text, re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
+
+
+def add_internal_page_link(page, rect, target_page: int):
+    if not target_page or target_page < 1:
+        return
+    try:
+        page.insert_link({
+            "kind": fitz.LINK_GOTO,
+            "from": rect,
+            "page": target_page - 1,
+            "to": fitz.Point(72, 72)
+        })
+    except Exception:
+        pass
+
+
+def get_pdf_base_output_path(pdf_path: str):
+    base, _ = os.path.splitext(pdf_path)
+    return base
+
+
 def qcolor_from_rgb01(rgb):
     return QtGui.QColor(int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255))
 
@@ -286,6 +319,9 @@ def draw_box_and_text_pdf(page, rect, text_lines, fill_color, bold=False, dashed
     line_gap = font_size + 1.2
     text_x = rect.x0 + TEXT_PADDING_X
     text_y = rect.y0 + font_size + TEXT_PADDING_Y
+
+    full_text = "\n".join(text_lines or [])
+    page_ref = extract_page_reference(full_text)
 
     for line in text_lines:
         try:
@@ -306,6 +342,28 @@ def draw_box_and_text_pdf(page, rect, text_lines, fill_color, bold=False, dashed
                 color=TEXT_COLOR,
                 overlay=True
             )
+
+        if page_ref:
+            m = re.search(r'\bpage\s+(\d+)\b', line, re.IGNORECASE)
+            if m:
+                page_num_text = m.group(1)
+                prefix = line[:m.start(1)]
+                try:
+                    prefix_width = fitz.get_text_length(prefix, fontname=fontname, fontsize=font_size)
+                    num_width = fitz.get_text_length(page_num_text, fontname=fontname, fontsize=font_size)
+                except Exception:
+                    prefix_width = estimate_text_width(prefix)
+                    num_width = estimate_text_width(page_num_text)
+
+                link_rect = fitz.Rect(
+                    text_x + prefix_width,
+                    text_y - font_size,
+                    text_x + prefix_width + num_width,
+                    text_y + 2
+                )
+                add_internal_page_link(page, link_rect, page_ref)
+                page_ref = None
+
         text_y += line_gap
 
 
@@ -373,18 +431,20 @@ class AnnotationDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Annotation Details")
-        self.resize(700, 460)
-        self.setMinimumSize(700, 460)
+        self.resize(700, 500)
+        self.setMinimumSize(700, 500)
         self.setModal(True)
+
+        self._updating_refpage_ui = False
 
         self.setStyleSheet("""
             QDialog { background-color: #f4f8ff; border-radius: 14px; }
             QLabel { font-family: 'Times New Roman'; font-size: 12pt; color: #1c2e4a; }
-            QLineEdit, QTextEdit {
+            QLineEdit, QTextEdit, QSpinBox {
                 background: #ffffff; border: 1px solid #a8bfdc; border-radius: 8px;
                 padding: 6px 8px; font-family: 'Times New Roman'; font-size: 12pt; color: #1a1a1a;
             }
-            QLineEdit:focus, QTextEdit:focus { border: 2px solid #4d8ef7; background: #fdfefe; }
+            QLineEdit:focus, QTextEdit:focus, QSpinBox:focus { border: 2px solid #4d8ef7; background: #fdfefe; }
             QCheckBox { font-family: 'Times New Roman'; font-size: 12pt; color: #143b66; spacing: 8px; }
             QCheckBox::indicator { width: 18px; height: 18px; }
             QDialogButtonBox QPushButton {
@@ -401,10 +461,19 @@ class AnnotationDialog(QtWidgets.QDialog):
         self.chk_domain = QtWidgets.QCheckBox("Domain")
         self.chk_assigned = QtWidgets.QCheckBox("Assigned field")
         self.chk_notsub = QtWidgets.QCheckBox("Not Submitted")
+        self.chk_refpage = QtWidgets.QCheckBox("Refer Page")
+
+        self.ref_page_label = QtWidgets.QLabel("Reference Page")
+        self.ref_page_spin = QtWidgets.QSpinBox()
+        self.ref_page_spin.setRange(1, 999999)
+        self.ref_page_spin.setValue(1)
+        self.ref_page_spin.setFixedWidth(110)
 
         self.chk_domain.stateChanged.connect(self.toggle_dialog_state)
         self.chk_assigned.stateChanged.connect(self.toggle_dialog_state)
         self.chk_notsub.stateChanged.connect(self.toggle_dialog_state)
+        self.chk_refpage.stateChanged.connect(self.toggle_dialog_state)
+        self.ref_page_spin.valueChanged.connect(self.on_ref_page_changed)
 
         title = QtWidgets.QLabel("Enter Annotation Metadata")
         title.setAlignment(QtCore.Qt.AlignCenter)
@@ -437,9 +506,17 @@ class AnnotationDialog(QtWidgets.QDialog):
         chk_row.addWidget(self.chk_domain)
         chk_row.addWidget(self.chk_assigned)
         chk_row.addWidget(self.chk_notsub)
+        chk_row.addWidget(self.chk_refpage)
         chk_row.addStretch()
 
-        note = QtWidgets.QLabel("If none is selected, it is treated as a variable annotation for a collected field.")
+        ref_row = QtWidgets.QHBoxLayout()
+        ref_row.setSpacing(12)
+        ref_row.addSpacing(8)
+        ref_row.addWidget(self.ref_page_label)
+        ref_row.addWidget(self.ref_page_spin)
+        ref_row.addStretch()
+
+        note = QtWidgets.QLabel("If none is selected, it is treated as a variable annotation for a collected field. Use Refer Page to create a standard page-reference annotation.")
         note.setWordWrap(True)
         note.setStyleSheet("QLabel { color: #556b84; font-size: 11pt; font-style: italic; }")
 
@@ -459,19 +536,78 @@ class AnnotationDialog(QtWidgets.QDialog):
         layout.addSpacing(8)
         layout.addWidget(anno_type_hdr)
         layout.addLayout(chk_row)
+        layout.addLayout(ref_row)
         layout.addWidget(note)
         layout.addSpacing(10)
         layout.addWidget(self.buttons)
 
         self.toggle_dialog_state()
 
+    def _set_ref_annotation_text(self):
+        ref_page = int(self.ref_page_spin.value())
+        self.domain_edit.setText("REF")
+        self.name_edit.setText("REF")
+        self.annotation_edit.setPlainText(f"For annotation refer to page {ref_page} from collected field.")
+
+    def on_ref_page_changed(self):
+        if self.chk_refpage.isChecked():
+            self._updating_refpage_ui = True
+            try:
+                self._set_ref_annotation_text()
+            finally:
+                self._updating_refpage_ui = False
+
     def toggle_dialog_state(self):
-        is_domain = self.chk_domain.isChecked()
+        if self._updating_refpage_ui:
+            return
+
+        is_refpage = self.chk_refpage.isChecked()
         is_notsub = self.chk_notsub.isChecked()
+        is_domain = self.chk_domain.isChecked()
+
+        self.ref_page_label.setVisible(is_refpage)
+        self.ref_page_spin.setVisible(is_refpage)
+
+        if is_refpage:
+            self._updating_refpage_ui = True
+            try:
+                self.chk_domain.setChecked(False)
+                self.chk_assigned.setChecked(False)
+                self.chk_notsub.setChecked(False)
+
+                self.chk_domain.setDisabled(True)
+                self.chk_assigned.setDisabled(True)
+                self.chk_notsub.setDisabled(True)
+
+                self.domain_edit.setDisabled(True)
+                self.name_edit.setDisabled(True)
+                self.annotation_edit.setDisabled(True)
+
+                self.lbl_name.setVisible(True)
+                self.name_edit.setVisible(True)
+
+                self._set_ref_annotation_text()
+            finally:
+                self._updating_refpage_ui = False
+            return
+
+        self.chk_domain.setDisabled(False)
+        self.chk_assigned.setDisabled(False)
+        self.chk_notsub.setDisabled(False)
+
+        self.domain_edit.setDisabled(False)
+        self.name_edit.setDisabled(False)
+        self.annotation_edit.setDisabled(False)
+
+        if self.domain_edit.text().strip().upper() == "REF":
+            self.domain_edit.clear()
+        if self.name_edit.text().strip().upper() == "REF":
+            self.name_edit.clear()
+        if self.annotation_edit.toPlainText().replace("\t", "    ").rstrip().upper().startswith("FOR ANNOTATION REFER TO PAGE "):
+            self.annotation_edit.clear()
 
         self.lbl_name.setVisible(not is_domain)
         self.name_edit.setVisible(not is_domain)
-
         if is_domain:
             self.name_edit.clear()
 
@@ -486,13 +622,9 @@ class AnnotationDialog(QtWidgets.QDialog):
             self.chk_domain.setDisabled(True)
             self.chk_assigned.setChecked(False)
             self.chk_assigned.setDisabled(True)
+            self.lbl_name.setVisible(True)
+            self.name_edit.setVisible(True)
         else:
-            self.domain_edit.setDisabled(False)
-            self.name_edit.setDisabled(False)
-            self.annotation_edit.setDisabled(False)
-            self.chk_domain.setDisabled(False)
-            self.chk_assigned.setDisabled(False)
-
             if self.domain_edit.text().strip() == "NOTSUB":
                 self.domain_edit.clear()
             if self.name_edit.text().strip() == "NOTSUB":
@@ -500,13 +632,17 @@ class AnnotationDialog(QtWidgets.QDialog):
             if self.annotation_edit.toPlainText().replace("\t", "    ").rstrip() == "[NOT SUBMITTED]":
                 self.annotation_edit.clear()
 
-            is_domain = self.chk_domain.isChecked()
             self.lbl_name.setVisible(not is_domain)
             self.name_edit.setVisible(not is_domain)
             if is_domain:
                 self.name_edit.clear()
 
     def validate_and_accept(self):
+        is_refpage = self.chk_refpage.isChecked()
+        if is_refpage:
+            self.accept()
+            return
+
         if not self.domain_edit.text().strip():
             QtWidgets.QMessageBox.warning(self, "Validation", "DOMAIN is required.")
             return
@@ -520,9 +656,22 @@ class AnnotationDialog(QtWidgets.QDialog):
         self.accept()
 
     def get_values(self):
+        is_refpage = self.chk_refpage.isChecked()
         is_domain_annotation = self.chk_domain.isChecked()
         is_assigned_field = self.chk_assigned.isChecked()
         is_not_submitted = self.chk_notsub.isChecked()
+
+        if is_refpage:
+            ref_page = int(self.ref_page_spin.value())
+            return {
+                "domain": "REF",
+                "name": "REF",
+                "annotation": f"For annotation refer to page {ref_page} from collected field.",
+                "assignedfield": "",
+                "is_domain_annotation": False,
+                "is_assigned_field": False,
+                "is_not_submitted": False
+            }
 
         if is_not_submitted:
             return {
@@ -1924,20 +2073,22 @@ class AnnotatorApp(QtWidgets.QWidget):
     # ------------------------------------------------------------------
     # CSV export / import
     # ------------------------------------------------------------------
-    def export_annotations_csv(self):
+    def export_annotations_csv(self, out_path=None, show_message=True):
         if not self.entries:
-            QtWidgets.QMessageBox.information(self, "Export Annotation CSV", "No annotations available to export.")
-            return
+            if show_message:
+                QtWidgets.QMessageBox.information(self, "Export Annotation CSV", "No annotations available to export.")
+            return False
 
-        default_path = os.path.join(
-            os.path.dirname(self.open_pdf_path) if self.open_pdf_path else SCRIPT_DIR,
-            "annotation_entries.csv"
-        )
-        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Export Annotation CSV", default_path, "CSV Files (*.csv)"
-        )
-        if not out_path:
-            return
+        if out_path is None:
+            default_path = os.path.join(
+                os.path.dirname(self.open_pdf_path) if self.open_pdf_path else SCRIPT_DIR,
+                "annotation_entries.csv"
+            )
+            out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self, "Export Annotation CSV", default_path, "CSV Files (*.csv)"
+            )
+            if not out_path:
+                return False
 
         try:
             with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
@@ -1981,9 +2132,13 @@ class AnnotatorApp(QtWidgets.QWidget):
                         "LINE_X2": ln.x2,
                         "LINE_Y2": ln.y2,
                     })
-            QtWidgets.QMessageBox.information(self, "Export Annotation CSV", f"Annotation CSV exported successfully:\n{out_path}")
+            if show_message:
+                QtWidgets.QMessageBox.information(self, "Export Annotation CSV", f"Annotation CSV exported successfully:\n{out_path}")
+            return True
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Export Annotation CSV", f"Failed to export annotation CSV:\n{e}")
+            if show_message:
+                QtWidgets.QMessageBox.critical(self, "Export Annotation CSV", f"Failed to export annotation CSV:\n{e}")
+            raise
 
     def get_pdf_page_rect(self, pageno: int):
         if not self.doc or pageno < 1 or pageno > len(self.doc):
@@ -2179,20 +2334,22 @@ class AnnotatorApp(QtWidgets.QWidget):
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Load Annotation CSV", f"Failed to load annotation CSV:\n{e}")
 
-    def export_bookmarks_csv(self):
+    def export_bookmarks_csv(self, out_path=None, show_message=True):
         if not self.bookmarks:
-            QtWidgets.QMessageBox.information(self, "Export Bookmark CSV", "No bookmarks available to export.")
-            return
+            if show_message:
+                QtWidgets.QMessageBox.information(self, "Export Bookmark CSV", "No bookmarks available to export.")
+            return False
 
-        default_path = os.path.join(
-            os.path.dirname(self.open_pdf_path) if self.open_pdf_path else SCRIPT_DIR,
-            "bookmark_entries.csv"
-        )
-        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Export Bookmark CSV", default_path, "CSV Files (*.csv)"
-        )
-        if not out_path:
-            return
+        if out_path is None:
+            default_path = os.path.join(
+                os.path.dirname(self.open_pdf_path) if self.open_pdf_path else SCRIPT_DIR,
+                "bookmark_entries.csv"
+            )
+            out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self, "Export Bookmark CSV", default_path, "CSV Files (*.csv)"
+            )
+            if not out_path:
+                return False
 
         try:
             with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
@@ -2204,9 +2361,13 @@ class AnnotatorApp(QtWidgets.QWidget):
                         "LEVEL": b.level,
                         "PAGENO": b.pageno,
                     })
-            QtWidgets.QMessageBox.information(self, "Export Bookmark CSV", f"Bookmark CSV exported successfully:\n{out_path}")
+            if show_message:
+                QtWidgets.QMessageBox.information(self, "Export Bookmark CSV", f"Bookmark CSV exported successfully:\n{out_path}")
+            return True
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Export Bookmark CSV", f"Failed to export bookmark CSV:\n{e}")
+            if show_message:
+                QtWidgets.QMessageBox.critical(self, "Export Bookmark CSV", f"Failed to export bookmark CSV:\n{e}")
+            raise
 
     def load_bookmarks_csv(self):
         if not self.doc:
@@ -2282,6 +2443,16 @@ class AnnotatorApp(QtWidgets.QWidget):
         try:
             QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
             doc = fitz.open(self.open_pdf_path)
+
+            pdf_base = get_pdf_base_output_path(output_pdf)
+            annotation_csv_path = pdf_base + "_annotation.csv"
+            bookmark_csv_path = pdf_base + "_bookmarks.csv"
+
+            if self.entries:
+                self.export_annotations_csv(annotation_csv_path, show_message=False)
+
+            if self.bookmarks:
+                self.export_bookmarks_csv(bookmark_csv_path, show_message=False)
 
             if self.entries:
                 for e in self.entries:
