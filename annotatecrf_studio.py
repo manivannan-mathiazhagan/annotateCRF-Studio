@@ -5,6 +5,8 @@
 #                  Desktop GUI utility for capturing annotation positions from a PDF and generating
 #                  final visible comment boxes directly into a PDF without XFDF / Adobe dependency.
 #
+# Version        : full updated script with append + duplicate-check CSV load fixes
+#
 #                  Workflow:
 #                    - Open PDF first
 #                    - Annotation mode:
@@ -98,12 +100,15 @@ DOMAIN_FONT_SIZE = 12
 
 TEXT_PADDING_X = 3.0
 TEXT_PADDING_Y = 1.5
-BOX_HEIGHT_NORMAL = 15.0
-BOX_HEIGHT_DOMAIN = 18.0
+BOX_HEIGHT_NORMAL = 13.0
+BOX_HEIGHT_DOMAIN = 16.0
 
 MAX_WRAP_WIDTH = 520.0
 RIGHT_PAGE_MARGIN = 12.0
-MIN_BOX_WIDTH = 90.0
+MIN_BOX_WIDTH = 55.0
+MIN_BOX_WIDTH_SINGLE = 42.0
+MIN_BOX_WIDTH_DOMAIN = 70.0
+MIN_BOX_WIDTH_MULTI = 90.0
 LONG_TEXT_THRESHOLD = 22
 LONG_TEXT_MIN_WIDTH = 220.0
 
@@ -224,43 +229,70 @@ def compute_entry_layout(entry, color_map, page_width=None):
     base_h = BOX_HEIGHT_DOMAIN if bold else BOX_HEIGHT_NORMAL
 
     text = (entry.annotation or "").replace("	", "    ").rstrip()
-    raw_w = max((estimate_text_width(line, scale=scale) for line in (text.splitlines() or [text])), default=MIN_BOX_WIDTH)
+    text_lines_raw = text.splitlines() or [text]
+    raw_w = max((estimate_text_width(line, scale=scale) for line in text_lines_raw), default=MIN_BOX_WIDTH_MULTI)
 
     allowed_width = MAX_WRAP_WIDTH
     if page_width is not None:
-        available = max(MIN_BOX_WIDTH, page_width - entry.x1 - RIGHT_PAGE_MARGIN)
+        available = max(MIN_BOX_WIDTH_SINGLE, page_width - entry.x1 - RIGHT_PAGE_MARGIN)
         allowed_width = min(MAX_WRAP_WIDTH, available)
 
-    preferred_width = raw_w
-
-    long_text = (
-        len(text) >= LONG_TEXT_THRESHOLD
-        or " when " in f" {text.lower()} "
-        or "/" in text
-        or "\n" in text
-    )
-    if long_text:
-        preferred_width = max(preferred_width, LONG_TEXT_MIN_WIDTH)
-
+    single_line_min = MIN_BOX_WIDTH_DOMAIN if bold else MIN_BOX_WIDTH_SINGLE
     explicit_w = clean_number(getattr(entry, "box_w", None), None)
+
     if explicit_w is not None:
-        box_w = max(MIN_BOX_WIDTH, min(allowed_width, explicit_w))
+        box_w = max(single_line_min, min(allowed_width, explicit_w))
+        lines = wrap_text_by_width(text, box_w, scale=scale)
     else:
-        box_w = min(allowed_width, preferred_width)
-        box_w = max(MIN_BOX_WIDTH, box_w)
+        tight_width = raw_w + (TEXT_PADDING_X * 2.0) + 6.0
+        raw_has_newline = "\n" in text
+        fits_single_line = (not raw_has_newline) and (tight_width <= allowed_width)
 
-    lines = wrap_text_by_width(text, box_w, scale=scale)
-    actual_w = max(estimate_text_width(line, scale=scale) for line in lines) if lines else raw_w
-    if explicit_w is None:
-        box_w = min(allowed_width, max(box_w, actual_w))
-        box_w = max(MIN_BOX_WIDTH, box_w)
+        if fits_single_line:
+            box_w = max(single_line_min, min(allowed_width, tight_width))
+            lines = [text]
+        else:
+            preferred_width = raw_w
+            long_text = (
+                len(text) >= LONG_TEXT_THRESHOLD
+                or " when " in f" {text.lower()} "
+                or raw_has_newline
+            )
+            if long_text:
+                preferred_width = max(preferred_width, LONG_TEXT_MIN_WIDTH)
 
-    computed_h = max(base_h, len(lines) * (font_size + 1.2) + 4)
+            multi_min = MIN_BOX_WIDTH_DOMAIN if bold else MIN_BOX_WIDTH_MULTI
+            box_w = max(multi_min, min(allowed_width, preferred_width))
+            lines = wrap_text_by_width(text, box_w, scale=scale)
+            actual_w = max((estimate_text_width(line, scale=scale) for line in lines), default=box_w)
+            if len(lines) <= 1 and actual_w + (TEXT_PADDING_X * 2.0) + 6.0 <= allowed_width:
+                box_w = max(single_line_min, min(allowed_width, actual_w + (TEXT_PADDING_X * 2.0) + 6.0))
+                lines = [text]
+            else:
+                box_w = max(multi_min, min(allowed_width, max(box_w, actual_w + 2.0)))
+                lines = wrap_text_by_width(text, box_w, scale=scale)
+
     explicit_h = clean_number(getattr(entry, "box_h", None), None)
     if explicit_h is not None:
         box_h = max(base_h, explicit_h)
     else:
-        box_h = computed_h
+        if len(lines) <= 1:
+            preview_padding_top = 1.5
+            preview_padding_bottom = 1.5
+            box_h = max(base_h, font_size + preview_padding_top + preview_padding_bottom + 0.2)
+        elif len(lines) == 2:
+            preview_line_gap = font_size + 0.6
+            preview_padding_top = 2.0
+            preview_padding_bottom = 2.0
+            box_h = max(base_h, len(lines) * preview_line_gap + preview_padding_top + preview_padding_bottom)
+        else:
+            preview_line_gap = font_size + 0.8
+            preview_padding_top = 2.5
+            preview_padding_bottom = 2.5
+            box_h = max(
+                base_h,
+                len(lines) * preview_line_gap + preview_padding_top + preview_padding_bottom
+            )
 
     return {
         "fill": fill,
@@ -271,9 +303,6 @@ def compute_entry_layout(entry, color_map, page_width=None):
         "box_w": box_w,
         "box_h": box_h
     }
-
-
-
 def extract_page_reference(text: str):
     if not text:
         return None
@@ -309,6 +338,67 @@ def qcolor_from_rgb01(rgb):
     return QtGui.QColor(int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255))
 
 
+def measure_textbox_height(text, width, fontname, fontsize, min_height):
+    """Use PyMuPDF textbox fitting to determine a safe box height.
+    Keeps single-line annotations compact while allowing long wrapped text to grow.
+    """
+    content = (text or "").rstrip()
+    if not content:
+        return float(min_height)
+
+    inner_width = max(24.0, float(width) - (TEXT_PADDING_X * 2.0))
+
+    # Compact path for single-line text that already fits within the box width
+    if "\n" not in content and estimate_text_width(content) <= inner_width:
+        return max(float(min_height), fontsize + 4.5)
+
+    probe_doc = fitz.open()
+    try:
+        probe_page = probe_doc.new_page(width=max(100.0, inner_width + 20.0), height=4000.0)
+        test_height = max(float(min_height), fontsize + 4.0)
+        for _ in range(120):
+            rect = fitz.Rect(10.0, 10.0, 10.0 + inner_width, 10.0 + test_height)
+            try:
+                rc = probe_page.insert_textbox(
+                    rect,
+                    content,
+                    fontname=fontname,
+                    fontsize=fontsize,
+                    color=TEXT_COLOR,
+                    align=fitz.TEXT_ALIGN_LEFT,
+                    lineheight=1.0,
+                    overlay=False
+                )
+            except Exception:
+                rc = probe_page.insert_textbox(
+                    rect,
+                    content,
+                    fontname=FONT_NORMAL,
+                    fontsize=fontsize,
+                    color=TEXT_COLOR,
+                    align=fitz.TEXT_ALIGN_LEFT,
+                    lineheight=1.0,
+                    overlay=False
+                )
+            if rc >= 0:
+                return max(float(min_height), test_height + 2.0)
+            test_height += max(4.0, fontsize * 0.75)
+        return max(float(min_height), test_height + 3.0)
+    finally:
+        probe_doc.close()
+
+
+def compute_output_box_height(text_lines, width, bold, font_size, base_h):
+    """Height for final PDF output only. Keeps preview compact while output stays safe."""
+    return measure_textbox_height(
+        "\n".join(text_lines or []),
+        width,
+        FONT_BOLD if bold else FONT_NORMAL,
+        font_size,
+        base_h
+    )
+
+
 def draw_box_and_text_pdf(page, rect, text_lines, fill_color, bold=False, dashed=False, font_size=10):
     page.draw_rect(rect, color=None, fill=fill_color, overlay=True)
 
@@ -316,60 +406,278 @@ def draw_box_and_text_pdf(page, rect, text_lines, fill_color, bold=False, dashed
     page.draw_rect(rect, color=BORDER_COLOR, fill=None, width=0.8, dashes=dashes, overlay=True)
 
     fontname = FONT_BOLD if bold else FONT_NORMAL
-    line_gap = font_size + 1.2
-    text_x = rect.x0 + TEXT_PADDING_X
-    text_y = rect.y0 + font_size + TEXT_PADDING_Y
-
     full_text = "\n".join(text_lines or [])
     page_ref = extract_page_reference(full_text)
 
-    for line in text_lines:
+    line_count = max(1, len(text_lines or []))
+    if line_count == 1:
+        lineheight = 0.95
+        visual_factor = 0.80
+    elif line_count == 2:
+        lineheight = 0.98
+        visual_factor = 0.92
+    else:
+        lineheight = 1.00
+        visual_factor = 0.96
+
+    text_block_height = max(font_size + 1.0, line_count * font_size * visual_factor * lineheight)
+    available_height = max(text_block_height, rect.height - 2.0)
+    y_offset = max(1.0, (available_height - text_block_height) / 2.0)
+
+    inner_rect = fitz.Rect(
+        rect.x0 + TEXT_PADDING_X,
+        rect.y0 + y_offset,
+        rect.x1 - TEXT_PADDING_X,
+        rect.y0 + y_offset + text_block_height
+    )
+
+    inserted = -1
+    try:
+        inserted = page.insert_textbox(
+            inner_rect,
+            full_text,
+            fontname=fontname,
+            fontsize=font_size,
+            color=TEXT_COLOR,
+            align=fitz.TEXT_ALIGN_LEFT,
+            lineheight=lineheight,
+            overlay=True
+        )
+    except Exception:
         try:
-            page.insert_text(
-                fitz.Point(text_x, text_y),
-                line,
-                fontname=fontname,
-                fontsize=font_size,
-                color=TEXT_COLOR,
-                overlay=True
-            )
-        except Exception:
-            page.insert_text(
-                fitz.Point(text_x, text_y),
-                line,
+            inserted = page.insert_textbox(
+                inner_rect,
+                full_text,
                 fontname=FONT_NORMAL,
                 fontsize=font_size,
                 color=TEXT_COLOR,
+                align=fitz.TEXT_ALIGN_LEFT,
+                lineheight=lineheight,
                 overlay=True
             )
+        except Exception:
+            inserted = -1
 
-        if page_ref:
-            m = re.search(r'\bpage\s+(\d+)\b', line, re.IGNORECASE)
-            if m:
-                page_num_text = m.group(1)
-                prefix = line[:m.start(1)]
-                try:
-                    prefix_width = fitz.get_text_length(prefix, fontname=fontname, fontsize=font_size)
-                    num_width = fitz.get_text_length(page_num_text, fontname=fontname, fontsize=font_size)
-                except Exception:
-                    prefix_width = estimate_text_width(prefix)
-                    num_width = estimate_text_width(page_num_text)
-
-                link_rect = fitz.Rect(
-                    text_x + prefix_width,
-                    text_y - font_size,
-                    text_x + prefix_width + num_width,
-                    text_y + 2
+    if inserted < 0 and text_lines:
+        # Safe fallback if insert_textbox cannot fit due to font metric mismatch
+        line_gap = font_size * (1.00 if line_count >= 3 else 0.98)
+        text_x = rect.x0 + TEXT_PADDING_X
+        text_y = rect.y0 + y_offset + font_size - 1.0
+        for line in text_lines:
+            try:
+                page.insert_text(
+                    fitz.Point(text_x, text_y),
+                    line,
+                    fontname=fontname,
+                    fontsize=font_size,
+                    color=TEXT_COLOR,
+                    overlay=True
                 )
-                add_internal_page_link(page, link_rect, page_ref)
-                page_ref = None
+            except Exception:
+                page.insert_text(
+                    fitz.Point(text_x, text_y),
+                    line,
+                    fontname=FONT_NORMAL,
+                    fontsize=font_size,
+                    color=TEXT_COLOR,
+                    overlay=True
+                )
+            text_y += line_gap
 
-        text_y += line_gap
+    if page_ref:
+        # Make the whole annotation box clickable for refer-page annotations.
+        add_internal_page_link(page, rect, page_ref)
 
 
 def sanitize_output_pdf_path(src_pdf: str):
     base, _ = os.path.splitext(src_pdf)
     return base + "_final.pdf"
+
+def extract_toc_entries(doc):
+    toc = doc.get_toc(simple=True)
+    entries = []
+    for entry in toc:
+        level, title, page_num = entry[:3]
+        entries.append((level, title.strip(), page_num - 1))  # 0-based page numbers
+    return entries
+
+def wrap_text(text, font_size, max_width):
+    words = text.split()
+    lines = []
+    current_line = ""
+    for word in words:
+        test_line = current_line + (" " if current_line else "") + word
+        if fitz.get_text_length(test_line, fontsize=font_size) <= max_width:
+            current_line = test_line
+        else:
+            if current_line:
+                lines.append(current_line)
+            current_line = word
+    if current_line:
+        lines.append(current_line)
+    return lines
+
+def paginate_wrapped_entries(toc_entries, font_size, max_width, lines_per_page):
+    paginated_entries = []
+    current_page_entries = []
+    current_line_count = 0
+
+    for entry in toc_entries:
+        level, title, target_page = entry
+        indent = 20 * (level - 1)
+        available_width = max_width - indent
+        wrapped_lines = wrap_text(title, font_size, available_width)
+        line_count = len(wrapped_lines)
+
+        if current_line_count + line_count > lines_per_page:
+            paginated_entries.append(current_page_entries)
+            current_page_entries = []
+            current_line_count = 0
+
+        current_page_entries.append((entry, wrapped_lines))
+        current_line_count += line_count
+
+    if current_page_entries:
+        paginated_entries.append(current_page_entries)
+
+    return paginated_entries
+
+def generate_toc_pages(paginated_entries, font_size, page_width, page_height):
+    toc_doc = fitz.open()
+    link_targets = []
+    left_margin = 50
+    right_margin = 60
+    top_margin = 50
+    y_spacing = font_size * 1.5
+
+    toc_page_count = len(paginated_entries)
+
+    for page_index, entries in enumerate(paginated_entries):
+        page = toc_doc.new_page(width=page_width, height=page_height)
+        y = top_margin
+        for (level, title, target_page), wrapped_lines in entries:
+            indent = 20 * (level - 1)
+            x = left_margin + indent
+            page_number_str = str(target_page + toc_page_count + 1)
+            page_number_width = fitz.get_text_length(page_number_str, fontsize=font_size)
+            max_x_for_dots = page_width - right_margin - page_number_width - 5
+
+            first_line_y = y  # Needed for hyperlink rectangle
+
+            for i, line in enumerate(wrapped_lines):
+                line_width = fitz.get_text_length(line, fontsize=font_size)
+                dots = ''
+                if i == len(wrapped_lines) - 1:
+                    dots_space = max_x_for_dots - (x + line_width + 10)
+                    dot_count = max(0, int(dots_space / fitz.get_text_length('.', fontsize=font_size)))
+                    dots = '.' * dot_count
+
+                    # Draw line with dots and page number
+                    page.insert_text((x, y), f"{line} {dots}", fontsize=font_size)
+                    page.insert_text((page_width - right_margin - page_number_width, y), page_number_str, fontsize=font_size)
+                else:
+                    # Draw line without dots/page number
+                    page.insert_text((x, y), line, fontsize=font_size)
+
+                y += y_spacing
+
+            rect = fitz.Rect(x, first_line_y - font_size, page_width - right_margin, y)
+            link_targets.append((page_index, rect, target_page))
+
+    return toc_doc, link_targets
+
+def add_toc_hyperlinks(doc, link_targets, toc_page_count):
+    for toc_page_index, rect, target_page in link_targets:
+        doc[toc_page_index].insert_link({
+            "kind": fitz.LINK_GOTO,
+            "from": rect,
+            "page": target_page + toc_page_count
+        })
+
+def shift_bookmark_pages(bookmarks, offset):
+    shifted = []
+    for bm in bookmarks:
+        if len(bm) >= 3:
+            level, title, page_num = bm[:3]
+            shifted.append([level, title, page_num + offset])
+    return shifted
+
+def add_existing_bookmarks(doc, bookmarks, offset):
+    shifted = shift_bookmark_pages(bookmarks, offset)
+    doc.set_toc(shifted)
+
+
+def build_toc_entries_from_bookmarks(bookmarks):
+    entries = []
+    for bm in bookmarks or []:
+        try:
+            level = max(1, int(getattr(bm, "level", 1)))
+            title = str(getattr(bm, "title", "")).strip()
+            target_page = max(0, int(getattr(bm, "pageno", 1)) - 1)
+        except Exception:
+            continue
+        if title:
+            entries.append((level, title, target_page))
+    return entries
+
+
+def compute_toc_page_count_from_bookmarks(bookmarks, font_size: int = 12, lines_per_page: int = 38):
+    toc_entries = build_toc_entries_from_bookmarks(bookmarks)
+    if not toc_entries:
+        return 0
+    width, _ = fitz.paper_size("a4")
+    max_width = width - 120
+    paginated_entries = paginate_wrapped_entries(toc_entries, font_size, max_width, lines_per_page)
+    return len(paginated_entries)
+
+
+def adjust_page_refs_in_text(text: str, page_offset: int) -> str:
+    if not text or not page_offset:
+        return text
+
+    def repl(match):
+        try:
+            page_num = int(match.group(1))
+            return f"page {page_num + page_offset}"
+        except Exception:
+            return match.group(0)
+
+    return re.sub(r"\bpage\s+(\d+)\b", repl, text, flags=re.IGNORECASE)
+
+
+def create_clickable_toc_pdf(input_pdf: str, output_pdf: str, font_size: int = 12, lines_per_page: int = 38):
+    original = fitz.open(input_pdf)
+    try:
+        toc_entries = extract_toc_entries(original)
+        original_bookmarks = original.get_toc()
+
+        if not toc_entries:
+            original.save(output_pdf)
+            return output_pdf
+
+        width, height = fitz.paper_size("a4")
+        max_width = width - 120
+
+        paginated_entries = paginate_wrapped_entries(toc_entries, font_size, max_width, lines_per_page)
+        toc_page_count = len(paginated_entries)
+
+        toc_pdf, link_targets = generate_toc_pages(paginated_entries, font_size, width, height)
+
+        final = fitz.open()
+        try:
+            final.insert_pdf(toc_pdf)
+            final.insert_pdf(original)
+            add_toc_hyperlinks(final, link_targets, toc_page_count)
+            add_existing_bookmarks(final, original_bookmarks, toc_page_count)
+            final.save(output_pdf, garbage=4, deflate=True)
+        finally:
+            final.close()
+            toc_pdf.close()
+
+        return output_pdf
+    finally:
+        original.close()
+
 
 
 def bool_from_entry(domain, name, annotation, assignedfield):
@@ -424,13 +732,53 @@ class ConnectorLineEntry:
     y2: float
 
 
+def _norm_text(value):
+    return str(value or "").replace("\t", "    ").strip()
+
+
+def annotation_entry_key(entry):
+    return (
+        _norm_text(getattr(entry, "domain", "")).upper(),
+        _norm_text(getattr(entry, "name", "")).upper(),
+        int(clean_number(getattr(entry, "pageno", 0), 0) or 0),
+        _norm_text(getattr(entry, "annotation", "")),
+        _norm_text(getattr(entry, "assignedfield", "")).upper(),
+        round(float(clean_number(getattr(entry, "x1", 0.0), 0.0) or 0.0), 3),
+        round(float(clean_number(getattr(entry, "y1", 0.0), 0.0) or 0.0), 3),
+        round(float(clean_number(getattr(entry, "pageh", 0.0), 0.0) or 0.0), 3),
+        round(float(clean_number(getattr(entry, "box_w", 0.0), 0.0) or 0.0), 3),
+        round(float(clean_number(getattr(entry, "box_h", 0.0), 0.0) or 0.0), 3),
+        bool(getattr(entry, "is_domain_annotation", False)),
+        bool(getattr(entry, "is_assigned_field", False)),
+        bool(getattr(entry, "is_not_submitted", False)),
+    )
+
+
+def connector_line_key(line):
+    return (
+        int(clean_number(getattr(line, "pageno", 0), 0) or 0),
+        round(float(clean_number(getattr(line, "x1", 0.0), 0.0) or 0.0), 3),
+        round(float(clean_number(getattr(line, "y1", 0.0), 0.0) or 0.0), 3),
+        round(float(clean_number(getattr(line, "x2", 0.0), 0.0) or 0.0), 3),
+        round(float(clean_number(getattr(line, "y2", 0.0), 0.0) or 0.0), 3),
+    )
+
+
+def bookmark_entry_key(bookmark):
+    return (
+        _norm_text(getattr(bookmark, "title", "")),
+        int(clean_number(getattr(bookmark, "level", 1), 1) or 1),
+        int(clean_number(getattr(bookmark, "pageno", 1), 1) or 1),
+    )
+
+
 # ================================
 # Dialog for annotation details
 # ================================
 class AnnotationDialog(QtWidgets.QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, initial_data=None, dialog_title="Annotation Details"):
         super().__init__(parent)
-        self.setWindowTitle("Annotation Details")
+        self.setWindowTitle(dialog_title)
         self.resize(700, 500)
         self.setMinimumSize(700, 500)
         self.setModal(True)
@@ -541,6 +889,35 @@ class AnnotationDialog(QtWidgets.QDialog):
         layout.addSpacing(10)
         layout.addWidget(self.buttons)
 
+        self.toggle_dialog_state()
+
+        if initial_data:
+            self.load_initial_data(initial_data)
+
+    def load_initial_data(self, data):
+        domain = (data.get("domain") or "").strip()
+        name = (data.get("name") or "").strip()
+        annotation = (data.get("annotation") or "").rstrip()
+        assignedfield = (data.get("assignedfield") or "").strip().upper()
+        is_domain_annotation = bool(data.get("is_domain_annotation", False))
+        is_assigned_field = bool(data.get("is_assigned_field", assignedfield == "Y"))
+        is_not_submitted = bool(data.get("is_not_submitted", False))
+        is_refpage = domain.upper() == "REF" and name.upper() == "REF" and annotation.upper().startswith("FOR ANNOTATION REFER TO PAGE ")
+
+        if is_refpage:
+            m = re.search(r"page\s+(\d+)", annotation, re.IGNORECASE)
+            if m:
+                self.ref_page_spin.setValue(int(m.group(1)))
+            self.chk_refpage.setChecked(True)
+            self.toggle_dialog_state()
+            return
+
+        self.chk_domain.setChecked(is_domain_annotation)
+        self.chk_assigned.setChecked(is_assigned_field)
+        self.chk_notsub.setChecked(is_not_submitted)
+        self.domain_edit.setText(domain)
+        self.name_edit.setText(name)
+        self.annotation_edit.setPlainText(annotation)
         self.toggle_dialog_state()
 
     def _set_ref_annotation_text(self):
@@ -699,9 +1076,9 @@ class AnnotationDialog(QtWidgets.QDialog):
 # Dialog for bookmark details
 # ================================
 class BookmarkDialog(QtWidgets.QDialog):
-    def __init__(self, page_no: int, parent=None):
+    def __init__(self, page_no: int, parent=None, initial_data=None, dialog_title="Bookmark Details"):
         super().__init__(parent)
-        self.setWindowTitle("Bookmark Details")
+        self.setWindowTitle(dialog_title)
         self.resize(760, 330)
         self.setMinimumSize(760, 330)
         self.setModal(True)
@@ -766,6 +1143,11 @@ class BookmarkDialog(QtWidgets.QDialog):
         layout.addWidget(note)
         layout.addSpacing(8)
         layout.addWidget(self.buttons)
+
+        if initial_data:
+            self.title_edit.setText(initial_data.get("title", ""))
+            self.level_spin.setValue(int(initial_data.get("level", 1)))
+            self.page_spin.setValue(int(initial_data.get("pageno", page_no)))
 
     def validate_and_accept(self):
         if not self.title_edit.text().strip():
@@ -949,7 +1331,7 @@ class PdfLabel(QtWidgets.QLabel):
             return
         if self.resize_entry_index is not None:
             entry = self.main_window.entries[self.resize_entry_index]
-            width = max(MIN_BOX_WIDTH, event.pos().x() / self.main_window.zoom - entry.x1)
+            width = max(MIN_BOX_WIDTH_SINGLE, event.pos().x() / self.main_window.zoom - entry.x1)
             height = max(BOX_HEIGHT_NORMAL, event.pos().y() / self.main_window.zoom - entry.y1)
             entry.box_w = round(width, 6)
             entry.box_h = round(height, 6)
@@ -1064,8 +1446,21 @@ class PdfLabel(QtWidgets.QLabel):
             painter.setFont(font)
             painter.setPen(QtGui.QColor(0, 0, 0))
 
-            line_gap = (layout["font_size"] + 1.2) * zoom * 0.75
-            ty = rect.top() + (layout["font_size"] + TEXT_PADDING_Y) * zoom * 0.75
+            line_count = max(1, len(layout["lines"]))
+            if line_count == 1:
+                line_gap = (layout["font_size"] + 0.6) * zoom * 0.75
+                visual_factor = 0.72
+            elif line_count == 2:
+                line_gap = (layout["font_size"] + 0.8) * zoom * 0.75
+                visual_factor = 0.88
+            else:
+                line_gap = (layout["font_size"] + 1.0) * zoom * 0.75
+                visual_factor = 0.94
+
+            text_block_height = line_count * line_gap * visual_factor
+            y_offset = max(0.0, (rect.height() - text_block_height) / 2.0)
+            ty = rect.top() + y_offset + (layout["font_size"] * zoom * 0.75) - 1.0
+
             for line in layout["lines"]:
                 line_indent = max(0.0, estimate_text_width(line) - estimate_text_width(line.lstrip(" "))) * zoom * 0.75
                 tx = rect.left() + TEXT_PADDING_X * zoom + line_indent
@@ -1124,7 +1519,7 @@ class PdfLabel(QtWidgets.QLabel):
 class AnnotatorApp(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Annotated CRF Studio")
+        self.setWindowTitle("AnnotateCRF Studio")
         self.resize(1280, 900)
         self.setMinimumSize(1100, 760)
         self.setStyleSheet("background-color: #f3f7fd;")
@@ -1177,7 +1572,7 @@ class AnnotatorApp(QtWidgets.QWidget):
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(8)
 
-        header = QtWidgets.QLabel("Annotated CRF Studio")
+        header = QtWidgets.QLabel("AnnotateCRF Studio")
         header.setAlignment(QtCore.Qt.AlignCenter)
         header.setStyleSheet("""
             QLabel {
@@ -1231,6 +1626,8 @@ class AnnotatorApp(QtWidgets.QWidget):
                 QPushButton {{ background-color: {bg}; color: {fg}; }}
                 QPushButton:hover:!disabled {{ background-color: {hov}; }}
             """)
+            b.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+            b.setMinimumWidth(max(170, b.fontMetrics().horizontalAdvance(text) + 42))
             return b
 
         # Top controls
@@ -1363,23 +1760,29 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.annotation_table.setColumnWidth(4, 110)
         ann_layout.addWidget(self.annotation_table)
 
-        ann_btn_row = QtWidgets.QHBoxLayout()
-        ann_btn_row.setSpacing(8)
+        ann_btn_grid = QtWidgets.QGridLayout()
+        ann_btn_grid.setHorizontalSpacing(8)
+        ann_btn_grid.setVerticalSpacing(8)
 
         self.btn_export_ann = mkbtn("Export Annotation CSV", "#2563eb", "#4a7df2")
         self.btn_load_ann = mkbtn("Load Annotation CSV", "#7c3aed", "#9b63f0")
+        self.btn_edit_ann = mkbtn("Edit Selected Annotation", "#0f766e", "#159287")
+        self.btn_copy_ann = mkbtn("Copy Selected Annotation", "#0369a1", "#0ea5e9")
+        self.btn_copy_ann_page = mkbtn("Copy Annotation To Page", "#0f766e", "#159287")
         self.btn_line_mode = mkbtn("Draw Connector Line", "#b45309", "#c97519")
         self.btn_clear_line = mkbtn("Clear Connector Line", "#475569", "#64748b")
         self.btn_delete_ann = mkbtn("Delete Selected Annotation", "#ef4444", "#f87171")
 
-        ann_btn_row.addWidget(self.btn_export_ann)
-        ann_btn_row.addWidget(self.btn_load_ann)
-        ann_btn_row.addWidget(self.btn_line_mode)
-        ann_btn_row.addWidget(self.btn_clear_line)
-        ann_btn_row.addStretch()
-        ann_btn_row.addWidget(self.btn_delete_ann)
+        ann_buttons = [
+            self.btn_export_ann, self.btn_load_ann, self.btn_edit_ann, self.btn_copy_ann,
+            self.btn_copy_ann_page, self.btn_line_mode, self.btn_clear_line, self.btn_delete_ann
+        ]
+        for i, btn in enumerate(ann_buttons):
+            ann_btn_grid.addWidget(btn, i // 4, i % 4)
+        for col in range(4):
+            ann_btn_grid.setColumnStretch(col, 1)
 
-        ann_layout.addLayout(ann_btn_row)
+        ann_layout.addLayout(ann_btn_grid)
         self.bottom_stack.addWidget(ann_page)
 
         # ==========================
@@ -1412,19 +1815,25 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.bookmark_table.setColumnWidth(2, 90)
         bm_layout.addWidget(self.bookmark_table)
 
-        bm_btn_row = QtWidgets.QHBoxLayout()
-        bm_btn_row.setSpacing(8)
+        bm_btn_grid = QtWidgets.QGridLayout()
+        bm_btn_grid.setHorizontalSpacing(8)
+        bm_btn_grid.setVerticalSpacing(8)
 
         self.btn_export_bm = mkbtn("Export Bookmark CSV", "#2563eb", "#4a7df2")
         self.btn_load_bm = mkbtn("Load Bookmark CSV", "#7c3aed", "#9b63f0")
+        self.btn_edit_bm = mkbtn("Edit Selected Bookmark", "#0f766e", "#159287")
+        self.btn_copy_bm = mkbtn("Copy Selected Bookmark", "#0369a1", "#0ea5e9")
         self.btn_delete_bm = mkbtn("Delete Selected Bookmark", "#ef4444", "#f87171")
 
-        bm_btn_row.addWidget(self.btn_export_bm)
-        bm_btn_row.addWidget(self.btn_load_bm)
-        bm_btn_row.addStretch()
-        bm_btn_row.addWidget(self.btn_delete_bm)
+        bm_buttons = [
+            self.btn_export_bm, self.btn_load_bm, self.btn_edit_bm, self.btn_copy_bm, self.btn_delete_bm
+        ]
+        for i, btn in enumerate(bm_buttons):
+            bm_btn_grid.addWidget(btn, i // 4, i % 4)
+        for col in range(4):
+            bm_btn_grid.setColumnStretch(col, 1)
 
-        bm_layout.addLayout(bm_btn_row)
+        bm_layout.addLayout(bm_btn_grid)
         self.bottom_stack.addWidget(bm_page)
 
         self.splitter.addWidget(self.bottom_stack)
@@ -1511,9 +1920,17 @@ class AnnotatorApp(QtWidgets.QWidget):
         review_splitter.setSizes([700, 500])
 
         self.btn_generate_pdf = mkbtn("Generate Final Output PDF", "#ff9933", "#ffbc80", "#222")
+        self.chk_add_toc = QtWidgets.QCheckBox("Add TOC with hyperlinks")
+        self.chk_add_toc.setStyleSheet("QCheckBox { font-family: 'Times New Roman'; font-size: 11pt; color: #27496d; padding: 4px 2px; }")
+
+        review_action_row = QtWidgets.QHBoxLayout()
+        review_action_row.setSpacing(10)
+        review_action_row.addWidget(self.chk_add_toc)
+        review_action_row.addStretch()
+        review_action_row.addWidget(self.btn_generate_pdf)
 
         review_layout.addWidget(review_splitter, 1)
-        review_layout.addWidget(self.btn_generate_pdf)
+        review_layout.addLayout(review_action_row)
         self.main_stack.addWidget(review_page)
 
         QtCore.QTimer.singleShot(0, self.init_splitter_sizes)
@@ -1538,6 +1955,11 @@ class AnnotatorApp(QtWidgets.QWidget):
 
         self.btn_export_ann.clicked.connect(self.export_annotations_csv)
         self.btn_load_ann.clicked.connect(self.load_annotations_csv)
+        self.btn_edit_ann.clicked.connect(self.edit_selected_annotation)
+        self.btn_copy_ann.clicked.connect(self.copy_selected_annotation)
+        self.btn_copy_ann_page.clicked.connect(self.copy_annotation_to_page)
+        self.btn_edit_bm.clicked.connect(self.edit_selected_bookmark)
+        self.btn_copy_bm.clicked.connect(self.copy_selected_bookmark)
         self.btn_delete_ann.clicked.connect(self.delete_selected_annotation)
         self.btn_line_mode.clicked.connect(self.start_connector_line_mode)
         self.btn_clear_line.clicked.connect(self.clear_connector_lines)
@@ -1737,7 +2159,7 @@ class AnnotatorApp(QtWidgets.QWidget):
         y1 = max(0, min(point.y() / self.zoom, self.page_rect.height))
         pageh = float(self.page_rect.height)
 
-        dlg = AnnotationDialog(self)
+        dlg = AnnotationDialog(self, dialog_title="Add Annotation")
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
             return
 
@@ -1876,6 +2298,9 @@ class AnnotatorApp(QtWidgets.QWidget):
                 self.render_page()
 
     def update_annotation_action_buttons(self):
+        has_selection = 0 <= self.selected_entry_index < len(self.entries)
+        self.btn_edit_ann.setEnabled(has_selection)
+        self.btn_copy_ann.setEnabled(has_selection)
         self.btn_line_mode.setEnabled(bool(self.pdf_loaded))
         self.btn_clear_line.setEnabled(bool(self.pdf_loaded and (self.lines or self.selected_line_index >= 0)))
 
@@ -2016,6 +2441,295 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.populate_review_annotation_table()
         self.populate_review_bookmark_table()
 
+    def annotation_entry_to_dialog_data(self, entry):
+        return {
+            "domain": entry.domain,
+            "name": entry.name,
+            "annotation": entry.annotation,
+            "assignedfield": entry.assignedfield,
+            "is_domain_annotation": entry.is_domain_annotation,
+            "is_assigned_field": entry.is_assigned_field,
+            "is_not_submitted": entry.is_not_submitted,
+        }
+
+    def edit_selected_annotation(self):
+        row = self.annotation_table.currentRow()
+        if row < 0 or row >= len(self.entries):
+            QtWidgets.QMessageBox.information(self, "Edit Annotation", "Please select an annotation row to edit.")
+            return
+
+        entry = self.entries[row]
+        dlg = AnnotationDialog(self, initial_data=self.annotation_entry_to_dialog_data(entry), dialog_title="Edit Annotation")
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+
+        vals = dlg.get_values()
+        entry.domain = vals["domain"]
+        entry.name = vals["name"]
+        entry.annotation = vals["annotation"]
+        entry.assignedfield = vals["assignedfield"]
+        entry.is_domain_annotation = vals["is_domain_annotation"]
+        entry.is_assigned_field = vals["is_assigned_field"]
+        entry.is_not_submitted = vals["is_not_submitted"]
+        entry.box_w = None
+        entry.box_h = None
+        entry.line_x1 = None
+        entry.line_y1 = None
+        entry.line_x2 = None
+        entry.line_y2 = None
+
+        self.selected_entry_index = row
+        self.refresh_annotation_table()
+        self.refresh_review_tables()
+        self.select_annotation_row_silent(row)
+        self.image_label.update()
+        self.has_annotation = len(self.entries) > 0
+        self.check_review_enable()
+
+    def copy_selected_annotation(self):
+        row = self.annotation_table.currentRow()
+        if row < 0 or row >= len(self.entries):
+            QtWidgets.QMessageBox.information(self, "Copy Annotation", "Please select an annotation row to copy.")
+            return
+
+        src = self.entries[row]
+        dlg = AnnotationDialog(self, initial_data=self.annotation_entry_to_dialog_data(src), dialog_title="Copy Annotation")
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+
+        vals = dlg.get_values()
+        x1 = round(src.x1 + 8.0, 6)
+        y1 = round(src.y1 + 8.0, 6)
+        if self.page_rect:
+            x1 = round(min(x1, max(0.0, self.page_rect.width - MIN_BOX_WIDTH_SINGLE - RIGHT_PAGE_MARGIN)), 6)
+            y1 = round(min(y1, max(0.0, self.page_rect.height - BOX_HEIGHT_NORMAL - 6.0)), 6)
+
+        new_entry = AnnotationEntry(
+            domain=vals["domain"],
+            name=vals["name"],
+            pageno=src.pageno,
+            annotation=vals["annotation"],
+            assignedfield=vals["assignedfield"],
+            x1=x1,
+            y1=y1,
+            pageh=src.pageh,
+            is_domain_annotation=vals["is_domain_annotation"],
+            is_assigned_field=vals["is_assigned_field"],
+            is_not_submitted=vals["is_not_submitted"],
+            box_w=None,
+            box_h=None,
+            line_x1=None,
+            line_y1=None,
+            line_x2=None,
+            line_y2=None
+        )
+        self.entries.append(new_entry)
+        self.selected_entry_index = len(self.entries) - 1
+        self.refresh_annotation_table()
+        self.refresh_review_tables()
+        self.select_annotation_row_silent(self.selected_entry_index)
+        self.image_label.update()
+        self.has_annotation = True
+        self.check_review_enable()
+
+    def copy_annotation_to_page(self):
+        row = self.annotation_table.currentRow()
+        if row < 0 or row >= len(self.entries):
+            QtWidgets.QMessageBox.information(self, "Copy Annotation To Page", "Please select an annotation row to copy.")
+            return
+        if not self.doc:
+            QtWidgets.QMessageBox.information(self, "Copy Annotation To Page", "Please open a PDF first.")
+            return
+
+        src = self.entries[row]
+        dlg = AnnotationDialog(self, initial_data=self.annotation_entry_to_dialog_data(src), dialog_title="Copy Annotation To Page")
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        vals = dlg.get_values()
+
+        opt = QtWidgets.QDialog(self)
+        opt.setWindowTitle("Copy Annotation To Page")
+        opt.setModal(True)
+        opt.resize(420, 220)
+        opt.setStyleSheet("""
+            QDialog { background-color: #f4f8ff; border-radius: 14px; }
+            QLabel { font-family: 'Times New Roman'; font-size: 12pt; color: #1c2e4a; }
+            QSpinBox {
+                background: #ffffff; border: 1px solid #a8bfdc; border-radius: 8px;
+                padding: 6px 8px; font-family: 'Times New Roman'; font-size: 12pt; color: #1a1a1a;
+            }
+            QCheckBox { font-family: 'Times New Roman'; font-size: 12pt; color: #143b66; spacing: 8px; }
+            QDialogButtonBox QPushButton {
+                font-family: 'Times New Roman'; font-size: 12pt; font-weight: bold;
+                border-radius: 10px; padding: 8px 18px; min-width: 100px;
+            }
+        """)
+
+        vbox = QtWidgets.QVBoxLayout(opt)
+        title = QtWidgets.QLabel("Copy Annotation To Another Page")
+        title.setAlignment(QtCore.Qt.AlignCenter)
+        title.setStyleSheet("""
+            QLabel {
+                background: #d9f99d; color: #1f4d0f; font-family: 'Times New Roman';
+                font-size: 14pt; font-weight: bold; padding: 10px; border-radius: 12px;
+            }
+        """)
+        vbox.addWidget(title)
+
+        form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(QtCore.Qt.AlignRight)
+        form.setHorizontalSpacing(18)
+        form.setVerticalSpacing(14)
+
+        target_page_spin = QtWidgets.QSpinBox()
+        target_page_spin.setRange(1, len(self.doc))
+        target_page_spin.setValue(src.pageno)
+
+        keep_pos_chk = QtWidgets.QCheckBox("Keep same position")
+        keep_pos_chk.setChecked(True)
+        offset_chk = QtWidgets.QCheckBox("Apply small offset when target page is same")
+        offset_chk.setChecked(True)
+
+        form.addRow("Target Page", target_page_spin)
+        form.addRow("", keep_pos_chk)
+        form.addRow("", offset_chk)
+        vbox.addLayout(form)
+
+        note = QtWidgets.QLabel("Connector lines are not copied automatically. You can draw a new line after copying if needed.")
+        note.setWordWrap(True)
+        note.setStyleSheet("QLabel { color: #556b84; font-size: 11pt; font-style: italic; }")
+        vbox.addWidget(note)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(opt.accept)
+        buttons.rejected.connect(opt.reject)
+        ok_btn = buttons.button(QtWidgets.QDialogButtonBox.Ok)
+        cancel_btn = buttons.button(QtWidgets.QDialogButtonBox.Cancel)
+        ok_btn.setStyleSheet("QPushButton { background-color: #55c16d; color: white; } QPushButton:hover { background-color: #73d789; }")
+        cancel_btn.setStyleSheet("QPushButton { background-color: #f16a6a; color: white; } QPushButton:hover { background-color: #f48f8f; }")
+        vbox.addWidget(buttons)
+
+        if opt.exec_() != QtWidgets.QDialog.Accepted:
+            return
+
+        target_page = int(target_page_spin.value())
+        target_page_obj = self.doc[target_page - 1]
+        target_page_w = float(target_page_obj.rect.width)
+        target_page_h = float(target_page_obj.rect.height)
+
+        if keep_pos_chk.isChecked():
+            new_x1 = float(src.x1)
+            new_y1 = float(src.y1)
+            if target_page == src.pageno and offset_chk.isChecked():
+                new_x1 += 8.0
+                new_y1 += 8.0
+        else:
+            new_x1 = 40.0
+            new_y1 = 40.0
+
+        max_w = max(0.0, target_page_w - MIN_BOX_WIDTH_SINGLE - RIGHT_PAGE_MARGIN)
+        max_h = max(0.0, target_page_h - BOX_HEIGHT_NORMAL - 6.0)
+        new_x1 = round(min(max(0.0, new_x1), max_w), 6)
+        new_y1 = round(min(max(0.0, new_y1), max_h), 6)
+
+        new_entry = AnnotationEntry(
+            domain=vals["domain"],
+            name=vals["name"],
+            pageno=target_page,
+            annotation=vals["annotation"],
+            assignedfield=vals["assignedfield"],
+            x1=new_x1,
+            y1=new_y1,
+            pageh=target_page_h,
+            is_domain_annotation=vals["is_domain_annotation"],
+            is_assigned_field=vals["is_assigned_field"],
+            is_not_submitted=vals["is_not_submitted"],
+            box_w=src.box_w,
+            box_h=src.box_h,
+            line_x1=None,
+            line_y1=None,
+            line_x2=None,
+            line_y2=None
+        )
+        self.entries.append(new_entry)
+        self.selected_entry_index = len(self.entries) - 1
+        self.refresh_annotation_table()
+        self.refresh_review_tables()
+        self.select_annotation_row_silent(self.selected_entry_index)
+        self.has_annotation = True
+        self.check_review_enable()
+
+        if self.current_page_index != target_page - 1:
+            self.current_page_index = target_page - 1
+            self.render_page()
+        else:
+            self.image_label.update()
+
+        QtWidgets.QMessageBox.information(self, "Copy Annotation To Page", f"Annotation copied to page {target_page}.")
+
+    def bookmark_entry_to_dialog_data(self, entry):
+        return {
+            "title": entry.title,
+            "level": entry.level,
+            "pageno": entry.pageno,
+        }
+
+    def edit_selected_bookmark(self):
+        row = self.bookmark_table.currentRow()
+        if row < 0 or row >= len(self.bookmarks):
+            QtWidgets.QMessageBox.information(self, "Edit Bookmark", "Please select a bookmark row to edit.")
+            return
+
+        bm = self.bookmarks[row]
+        dlg = BookmarkDialog(bm.pageno, self, initial_data=self.bookmark_entry_to_dialog_data(bm), dialog_title="Edit Bookmark")
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+
+        vals = dlg.get_values()
+        bm.title = vals["title"]
+        bm.level = vals["level"]
+        bm.pageno = vals["pageno"]
+
+        self.selected_bookmark_index = row
+        self.refresh_bookmark_table()
+        self.refresh_review_tables()
+        self.select_bookmark_row_silent(row)
+        if self.doc:
+            self.current_page_index = max(0, min(len(self.doc) - 1, bm.pageno - 1))
+            self.render_page()
+        else:
+            self.image_label.update()
+        self.has_bookmark = len(self.bookmarks) > 0
+        self.check_review_enable()
+
+    def copy_selected_bookmark(self):
+        row = self.bookmark_table.currentRow()
+        if row < 0 or row >= len(self.bookmarks):
+            QtWidgets.QMessageBox.information(self, "Copy Bookmark", "Please select a bookmark row to copy.")
+            return
+
+        src = self.bookmarks[row]
+        initial = self.bookmark_entry_to_dialog_data(src).copy()
+        initial["pageno"] = src.pageno
+        dlg = BookmarkDialog(src.pageno, self, initial_data=initial, dialog_title="Copy Bookmark")
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+
+        vals = dlg.get_values()
+        new_bm = BookmarkEntry(
+            title=vals["title"],
+            level=vals["level"],
+            pageno=vals["pageno"]
+        )
+        self.bookmarks.append(new_bm)
+        self.selected_bookmark_index = len(self.bookmarks) - 1
+        self.refresh_bookmark_table()
+        self.refresh_review_tables()
+        self.select_bookmark_row_silent(self.selected_bookmark_index)
+        self.image_label.update()
+        self.has_bookmark = True
+        self.check_review_enable()
+
     # ------------------------------------------------------------------
     # Delete actions
     # ------------------------------------------------------------------
@@ -2073,8 +2787,8 @@ class AnnotatorApp(QtWidgets.QWidget):
     # ------------------------------------------------------------------
     # CSV export / import
     # ------------------------------------------------------------------
-    def export_annotations_csv(self, out_path=None, show_message=True):
-        if not self.entries:
+    def export_annotations_csv(self, out_path=None, show_message=True, page_offset=0, create_blank_if_none=True):
+        if not self.entries and not self.lines and not create_blank_if_none:
             if show_message:
                 QtWidgets.QMessageBox.information(self, "Export Annotation CSV", "No annotations available to export.")
             return False
@@ -2099,8 +2813,8 @@ class AnnotatorApp(QtWidgets.QWidget):
                         "TYPE": "ANNOTATION",
                         "DOMAIN": e.domain,
                         "NAME": e.name,
-                        "PAGENO": e.pageno,
-                        "ANNOTATION": e.annotation,
+                        "PAGENO": int(e.pageno) + int(page_offset),
+                        "ANNOTATION": adjust_page_refs_in_text(e.annotation, page_offset),
                         "ASSIGNEDFIELD": e.assignedfield,
                         "X1": e.x1,
                         "Y1": e.y1,
@@ -2126,7 +2840,7 @@ class AnnotatorApp(QtWidgets.QWidget):
                         "PAGEH": "",
                         "BOX_W": "",
                         "BOX_H": "",
-                        "LINE_PAGENO": ln.pageno,
+                        "LINE_PAGENO": int(ln.pageno) + int(page_offset),
                         "LINE_X1": ln.x1,
                         "LINE_Y1": ln.y1,
                         "LINE_X2": ln.x2,
@@ -2186,8 +2900,18 @@ class AnnotatorApp(QtWidgets.QWidget):
             return
 
         try:
-            loaded_entries = []
-            loaded_lines = []
+            existing_entries = list(self.entries)
+            existing_lines = list(self.lines)
+            loaded_entries = list(existing_entries)
+            loaded_lines = list(existing_lines)
+
+            entry_keys = {annotation_entry_key(e) for e in loaded_entries}
+            line_keys = {connector_line_key(l) for l in loaded_lines}
+
+            added_entry_count = 0
+            duplicate_entry_count = 0
+            added_line_count = 0
+            duplicate_line_count = 0
             missing_position_count = 0
 
             with open(in_path, "r", newline="", encoding="utf-8-sig") as f:
@@ -2199,8 +2923,8 @@ class AnnotatorApp(QtWidgets.QWidget):
                 if missing:
                     raise ValueError(
                         "Annotation CSV is missing required columns.\n"
-                        f"Minimum required: {', '.join(sorted(required_min))}\n"
-                        f"Missing: {', '.join(sorted(missing))}"
+                        f"Minimum required: {", ".join(sorted(required_min))}\n"
+                        f"Missing: {", ".join(sorted(missing))}"
                     )
 
                 for row in reader:
@@ -2213,24 +2937,26 @@ class AnnotatorApp(QtWidgets.QWidget):
                         line_x2 = clean_number(row.get("LINE_X2"), None)
                         line_y2 = clean_number(row.get("LINE_Y2"), None)
 
-                        if (
-                            line_pageno >= 1 and
-                            None not in (line_x1, line_y1, line_x2, line_y2)
-                        ):
-                            loaded_lines.append(
-                                ConnectorLineEntry(
-                                    pageno=line_pageno,
-                                    x1=line_x1,
-                                    y1=line_y1,
-                                    x2=line_x2,
-                                    y2=line_y2
-                                )
+                        if line_pageno >= 1 and None not in (line_x1, line_y1, line_x2, line_y2):
+                            new_line = ConnectorLineEntry(
+                                pageno=line_pageno,
+                                x1=line_x1,
+                                y1=line_y1,
+                                x2=line_x2,
+                                y2=line_y2
                             )
+                            key = connector_line_key(new_line)
+                            if key in line_keys:
+                                duplicate_line_count += 1
+                            else:
+                                loaded_lines.append(new_line)
+                                line_keys.add(key)
+                                added_line_count += 1
                         continue
 
                     domain = (row.get("DOMAIN") or "").strip()
                     name = (row.get("NAME") or "").strip()
-                    annotation = (row.get("ANNOTATION") or "").replace("\t", "    ").rstrip()
+                    annotation = (row.get("ANNOTATION") or "").replace("	", "    ").rstrip()
                     assignedfield = (row.get("ASSIGNEDFIELD") or "").strip()
 
                     if not domain and not name and not annotation:
@@ -2276,46 +3002,60 @@ class AnnotatorApp(QtWidgets.QWidget):
                         domain, name, annotation, assignedfield
                     )
 
-                    loaded_entries.append(
-                        AnnotationEntry(
-                            domain=domain,
-                            name=name,
+                    new_entry = AnnotationEntry(
+                        domain=domain,
+                        name=name,
+                        pageno=pageno,
+                        annotation=annotation,
+                        assignedfield=assignedfield,
+                        x1=round(x1, 6),
+                        y1=round(y1, 6),
+                        pageh=round(pageh, 6),
+                        is_domain_annotation=is_domain_annotation,
+                        is_assigned_field=is_assigned_field,
+                        is_not_submitted=is_not_submitted,
+                        box_w=box_w,
+                        box_h=box_h,
+                        line_x1=line_x1,
+                        line_y1=line_y1,
+                        line_x2=line_x2,
+                        line_y2=line_y2
+                    )
+
+                    entry_key = annotation_entry_key(new_entry)
+                    if entry_key in entry_keys:
+                        duplicate_entry_count += 1
+                        continue
+
+                    loaded_entries.append(new_entry)
+                    entry_keys.add(entry_key)
+                    added_entry_count += 1
+
+                    if None not in (line_x1, line_y1, line_x2, line_y2):
+                        embedded_line = ConnectorLineEntry(
                             pageno=pageno,
-                            annotation=annotation,
-                            assignedfield=assignedfield,
-                            x1=round(x1, 6),
-                            y1=round(y1, 6),
-                            pageh=round(pageh, 6),
-                            is_domain_annotation=is_domain_annotation,
-                            is_assigned_field=is_assigned_field,
-                            is_not_submitted=is_not_submitted,
-                            box_w=box_w,
-                            box_h=box_h,
-                            line_x1=line_x1,
-                            line_y1=line_y1,
-                            line_x2=line_x2,
-                            line_y2=line_y2
+                            x1=line_x1,
+                            y1=line_y1,
+                            x2=line_x2,
+                            y2=line_y2
                         )
-                    )
+                        line_key = connector_line_key(embedded_line)
+                        if line_key in line_keys:
+                            duplicate_line_count += 1
+                        else:
+                            loaded_lines.append(embedded_line)
+                            line_keys.add(line_key)
+                            added_line_count += 1
 
-            self.entries = loaded_entries
-            self.lines = loaded_lines
-
-            for e in self.entries:
+            for e in loaded_entries:
                 if None not in (e.line_x1, e.line_y1, e.line_x2, e.line_y2):
-                    self.lines.append(
-                        ConnectorLineEntry(
-                            pageno=e.pageno,
-                            x1=e.line_x1,
-                            y1=e.line_y1,
-                            x2=e.line_x2,
-                            y2=e.line_y2
-                        )
-                    )
                     e.line_x1 = None
                     e.line_y1 = None
                     e.line_x2 = None
                     e.line_y2 = None
+
+            self.entries = loaded_entries
+            self.lines = loaded_lines
 
             self.selected_entry_index = -1
             self.selected_line_index = -1
@@ -2326,7 +3066,14 @@ class AnnotatorApp(QtWidgets.QWidget):
             self.has_annotation = len(self.entries) > 0
             self.check_review_enable()
 
-            msg = f"Loaded {len(self.entries)} annotation row(s)."
+            msg = (
+                f"Annotations added: {added_entry_count}\n"
+                f"Duplicate annotation rows skipped: {duplicate_entry_count}\n"
+                f"Connector lines added: {added_line_count}\n"
+                f"Duplicate connector lines skipped: {duplicate_line_count}\n"
+                f"Total annotations: {len(self.entries)}\n"
+                f"Total connector lines: {len(self.lines)}"
+            )
             if missing_position_count:
                 msg += f"\n\n{missing_position_count} row(s) had blank position values and were placed at default locations. You can drag them after loading."
             QtWidgets.QMessageBox.information(self, "Load Annotation CSV", msg)
@@ -2334,8 +3081,8 @@ class AnnotatorApp(QtWidgets.QWidget):
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Load Annotation CSV", f"Failed to load annotation CSV:\n{e}")
 
-    def export_bookmarks_csv(self, out_path=None, show_message=True):
-        if not self.bookmarks:
+    def export_bookmarks_csv(self, out_path=None, show_message=True, page_offset=0, create_blank_if_none=True):
+        if not self.bookmarks and not create_blank_if_none:
             if show_message:
                 QtWidgets.QMessageBox.information(self, "Export Bookmark CSV", "No bookmarks available to export.")
             return False
@@ -2359,7 +3106,7 @@ class AnnotatorApp(QtWidgets.QWidget):
                     writer.writerow({
                         "TITLE": b.title,
                         "LEVEL": b.level,
-                        "PAGENO": b.pageno,
+                        "PAGENO": int(b.pageno) + int(page_offset),
                     })
             if show_message:
                 QtWidgets.QMessageBox.information(self, "Export Bookmark CSV", f"Bookmark CSV exported successfully:\n{out_path}")
@@ -2381,7 +3128,12 @@ class AnnotatorApp(QtWidgets.QWidget):
             return
 
         try:
-            loaded_bookmarks = []
+            existing_bookmarks = list(self.bookmarks)
+            loaded_bookmarks = list(existing_bookmarks)
+            bookmark_keys = {bookmark_entry_key(b) for b in loaded_bookmarks}
+            added_bookmark_count = 0
+            duplicate_bookmark_count = 0
+
             with open(in_path, "r", newline="", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
                 expected = set(BOOKMARK_CSV_COLUMNS)
@@ -2400,13 +3152,18 @@ class AnnotatorApp(QtWidgets.QWidget):
                     level = int(clean_number(row.get("LEVEL"), 1) or 1)
                     pageno = int(clean_number(row.get("PAGENO"), 1) or 1)
 
-                    loaded_bookmarks.append(
-                        BookmarkEntry(
-                            title=title,
-                            level=level,
-                            pageno=pageno
-                        )
+                    new_bookmark = BookmarkEntry(
+                        title=title,
+                        level=level,
+                        pageno=pageno
                     )
+                    key = bookmark_entry_key(new_bookmark)
+                    if key in bookmark_keys:
+                        duplicate_bookmark_count += 1
+                    else:
+                        loaded_bookmarks.append(new_bookmark)
+                        bookmark_keys.add(key)
+                        added_bookmark_count += 1
 
             self.bookmarks = loaded_bookmarks
             self.selected_bookmark_index = -1
@@ -2417,13 +3174,82 @@ class AnnotatorApp(QtWidgets.QWidget):
             self.has_bookmark = len(self.bookmarks) > 0
             self.check_review_enable()
 
-            QtWidgets.QMessageBox.information(self, "Load Bookmark CSV", f"Loaded {len(self.bookmarks)} bookmark row(s).")
+            QtWidgets.QMessageBox.information(
+                self,
+                "Load Bookmark CSV",
+                f"Bookmarks added: {added_bookmark_count}\n"
+                f"Duplicate bookmark rows skipped: {duplicate_bookmark_count}\n"
+                f"Total bookmarks: {len(self.bookmarks)}"
+            )
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Load Bookmark CSV", f"Failed to load bookmark CSV:\n{e}")
+
+    def export_variables_csv(self, out_path=None, show_message=True, page_offset=0, create_blank_if_none=True):
+        variable_rows = OrderedDict()
+
+        for e in self.entries:
+            domain = (e.domain or "").strip()
+            name = (e.name or "").strip()
+
+            if not domain or not name:
+                continue
+            if domain.strip().upper() == "REF" and name.strip().upper() == "REF":
+                continue
+            if e.is_domain_annotation:
+                continue
+            if e.is_assigned_field:
+                continue
+            if e.is_not_submitted:
+                continue
+
+            key = (domain.upper(), name.upper())
+            if key not in variable_rows:
+                variable_rows[key] = {
+                    "DOMAIN": domain,
+                    "VARIABLE": name,
+                    "pages": set()
+                }
+            variable_rows[key]["pages"].add(int(e.pageno) + int(page_offset))
+
+        if not variable_rows and not create_blank_if_none:
+            if show_message:
+                QtWidgets.QMessageBox.information(self, "Export Variables CSV", "No variable annotations available to export.")
+            return False
+
+        if out_path is None:
+            default_path = os.path.join(
+                os.path.dirname(self.open_pdf_path) if self.open_pdf_path else SCRIPT_DIR,
+                "variables.csv"
+            )
+            out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self, "Export Variables CSV", default_path, "CSV Files (*.csv)"
+            )
+            if not out_path:
+                return False
+
+        try:
+            with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=["DOMAIN", "VARIABLE", "PAGES"])
+                writer.writeheader()
+                for _, item in variable_rows.items():
+                    pages = sorted(item["pages"])
+                    writer.writerow({
+                        "DOMAIN": item["DOMAIN"],
+                        "VARIABLE": item["VARIABLE"],
+                        "PAGES": ",".join(str(p) for p in pages)
+                    })
+            if show_message:
+                QtWidgets.QMessageBox.information(self, "Export Variables CSV", f"Variables CSV exported successfully:\n{out_path}")
+            return True
+        except Exception as e:
+            if show_message:
+                QtWidgets.QMessageBox.critical(self, "Export Variables CSV", f"Failed to export variables CSV:\n{e}")
+            raise
 
     # ------------------------------------------------------------------
     # Final PDF generation
     # ------------------------------------------------------------------
+
     def generate_final_output_pdf(self):
         if not self.open_pdf_path or not os.path.exists(self.open_pdf_path):
             QtWidgets.QMessageBox.warning(self, "Generate PDF", "Please open the source PDF first.")
@@ -2440,6 +3266,7 @@ class AnnotatorApp(QtWidgets.QWidget):
         if not output_pdf:
             return
 
+        temp_base_pdf = None
         try:
             QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
             doc = fitz.open(self.open_pdf_path)
@@ -2447,12 +3274,12 @@ class AnnotatorApp(QtWidgets.QWidget):
             pdf_base = get_pdf_base_output_path(output_pdf)
             annotation_csv_path = pdf_base + "_annotation.csv"
             bookmark_csv_path = pdf_base + "_bookmarks.csv"
+            variables_csv_path = pdf_base + "_variables.csv"
 
-            if self.entries:
-                self.export_annotations_csv(annotation_csv_path, show_message=False)
-
-            if self.bookmarks:
-                self.export_bookmarks_csv(bookmark_csv_path, show_message=False)
+            add_toc_checked = bool(self.chk_add_toc.isChecked() and self.bookmarks)
+            toc_page_offset = 0
+            if add_toc_checked:
+                toc_page_offset = compute_toc_page_count_from_bookmarks(self.bookmarks, font_size=12, lines_per_page=38)
 
             if self.entries:
                 for e in self.entries:
@@ -2476,10 +3303,39 @@ class AnnotatorApp(QtWidgets.QWidget):
                         shift = -rect.y0
                         rect = fitz.Rect(rect.x0, rect.y0 + shift, rect.x1, rect.y1 + shift)
 
+                    annotation_text_for_output = adjust_page_refs_in_text(e.annotation, toc_page_offset)
+                    layout_for_output = dict(layout)
+                    layout_for_output["lines"] = wrap_text_by_width(
+                        annotation_text_for_output,
+                        layout["box_w"],
+                        scale=(DOMAIN_FONT_SIZE / BASE_FONT_SIZE if layout["bold"] else 1.0)
+                    )
+                    output_base_h = BOX_HEIGHT_DOMAIN if layout["bold"] else BOX_HEIGHT_NORMAL
+                    output_box_h = compute_output_box_height(
+                        layout_for_output["lines"],
+                        layout["box_w"],
+                        layout["bold"],
+                        layout["font_size"],
+                        output_base_h
+                    )
+                    rect = rect_from_top_origin(e.x1, e.y1, layout["box_w"], output_box_h, e.pageh)
+
+                    if rect.x1 > page.rect.width:
+                        shift = rect.x1 - page.rect.width
+                        rect = fitz.Rect(rect.x0 - shift, rect.y0, rect.x1 - shift, rect.y1)
+
+                    if rect.y1 > page.rect.height:
+                        shift = rect.y1 - page.rect.height
+                        rect = fitz.Rect(rect.x0, rect.y0 - shift, rect.x1, rect.y1 - shift)
+
+                    if rect.y0 < 0:
+                        shift = -rect.y0
+                        rect = fitz.Rect(rect.x0, rect.y0 + shift, rect.x1, rect.y1 + shift)
+
                     draw_box_and_text_pdf(
                         page=page,
                         rect=rect,
-                        text_lines=layout["lines"],
+                        text_lines=layout_for_output["lines"],
                         fill_color=layout["fill"],
                         bold=layout["bold"],
                         dashed=layout["dashed"],
@@ -2519,23 +3375,73 @@ class AnnotatorApp(QtWidgets.QWidget):
                 if toc:
                     doc.set_toc(toc)
 
-            doc.save(output_pdf, garbage=4, deflate=True)
-            doc.close()
+            final_pdf_path = output_pdf
+            toc_added = False
+
+            if add_toc_checked:
+                temp_base_pdf = pdf_base + "__base_no_toc_tmp__.pdf"
+                if os.path.exists(temp_base_pdf):
+                    try:
+                        os.remove(temp_base_pdf)
+                    except Exception:
+                        pass
+                doc.save(temp_base_pdf, garbage=4, deflate=True)
+                doc.close()
+                create_clickable_toc_pdf(temp_base_pdf, output_pdf, 12)
+                final_pdf_path = output_pdf
+                toc_added = toc_page_offset > 0
+                try:
+                    if os.path.exists(temp_base_pdf):
+                        os.remove(temp_base_pdf)
+                except Exception:
+                    pass
+                temp_base_pdf = None
+            else:
+                doc.save(output_pdf, garbage=4, deflate=True)
+                doc.close()
+
+            # Always create all 3 CSV files so they match the actual final PDF.
+            self.export_annotations_csv(
+                annotation_csv_path,
+                show_message=False,
+                page_offset=toc_page_offset,
+                create_blank_if_none=True
+            )
+            self.export_bookmarks_csv(
+                bookmark_csv_path,
+                show_message=False,
+                page_offset=toc_page_offset,
+                create_blank_if_none=True
+            )
+            self.export_variables_csv(
+                variables_csv_path,
+                show_message=False,
+                page_offset=toc_page_offset,
+                create_blank_if_none=True
+            )
 
             what_written = []
             if self.entries:
                 what_written.append(f"{len(self.entries)} annotation(s)")
             if self.bookmarks:
                 what_written.append(f"{len(self.bookmarks)} bookmark(s)")
+            what_written.append("3 CSV file(s)")
+            if toc_added:
+                what_written.append("TOC with hyperlinks")
 
             QtWidgets.QMessageBox.information(
                 self,
                 "Final Output PDF Generated",
-                f"Final PDF created successfully:\n{output_pdf}\n\nEmbedded: {', '.join(what_written)}"
+                f"Final PDF created successfully:\n{final_pdf_path}\n\nEmbedded/Generated: {', '.join(what_written)}"
             )
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Error", f"Failed to generate final PDF:\n{e}")
         finally:
+            try:
+                if temp_base_pdf and os.path.exists(temp_base_pdf):
+                    os.remove(temp_base_pdf)
+            except Exception:
+                pass
             QtWidgets.QApplication.restoreOverrideCursor()
 
 
