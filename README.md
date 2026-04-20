@@ -1,247 +1,271 @@
-# Annotated CRF Studio
+# AnnotateCRF Studio
 
 ## Overview
+AnnotateCRF Studio is a desktop GUI utility for creating CDISC-compliant annotated CRFs (aCRFs) without relying on licensed PDF tools.
 
-**Annotated CRF Studio** is a Python-based desktop GUI application designed to enable **one-click annotation and bookmarking of CRFs** in a simple, efficient, and user-friendly workflow.
-
-It supports **MSG 2.0–compliant annotated CRFs (aCRFs)** and streamlines annotation, review, and final PDF generation without external dependencies.
-
----
-
-## Key Advantages
-
-* No licensing required
-* Enables multi-user annotation workflow using CSV files
-* Eliminates file access and sharing conflicts during annotation
-* Supports distributed annotation (page-wise or user-wise)
-* Centralized merge using CSV import
-* Lightweight, fast, and easy to deploy
+It supports:
+- Annotation box creation with positioning
+- Domain-based color coding
+- Bookmark generation
+- CSV-based import and export for multi-user workflows
+- Final PDF generation with embedded annotations
+- Clickable internal page-reference links
+- A clean desktop GUI built with Python, PyMuPDF, and PyQt5
 
 ---
 
-## Key Features
+## How to Run
 
-### Annotation
+### Recommended
+Double-click this file:
 
-* Click anywhere on the PDF to add annotations
-* Supports:
+`annotatecrf_studio.pyw`
 
-  * Domain-level annotations
-  * Variable-level annotations
-  * Assigned fields (dashed border)
-  * Not Submitted fields
-* Drag-and-drop repositioning of annotation boxes
-* Automatic text wrapping and dynamic box sizing
-* Domain-based color coding
+This opens the GUI directly without a black console window.
 
-### Bookmarking
+### If double-click does not work
+The `.pyw` file association is not set on that machine. To fix it:
 
-* Add bookmarks per page
-* Define:
+1. Right-click `annotatecrf_studio.pyw`
+2. Choose **Open with**
+3. Choose **Choose another app**
+4. Browse to `pythonw.exe`
+5. Check **Always use this app to open .pyw files**
 
-  * Bookmark text
-  * Hierarchy level
-  * Page number
-* Visual preview in UI
-* Export and import bookmark metadata
+Use `pythonw.exe`, not `python.exe`, so the app opens without a console window.
+
+### Alternative launcher
+You can also keep a BAT launcher outside the app folder.
+
+Example structure:
+
+```text
+project_folder/
+│
+├── run_annotatecrf.bat
+└── app/
+    ├── annotatecrf_studio.pyw
+    ├── annotator_icon.ico
+    └── annotator_icon.png
+```
+
+Example BAT file:
+
+```bat
+@echo off
+cd /d "%~dp0"
+start "" pythonw "app\annotatecrf_studio.pyw"
+exit
+```
+
+---
+
+## Main Features
+
+### Annotation Mode
+- Open a PDF and click on a page to add an annotation
+- Enter metadata through a dialog
+- Preview annotation boxes immediately
+- Drag boxes to reposition them
+- Resize selected annotation boxes
+- Edit, copy, and delete annotations
+- Supports variable annotations, domain annotations, assigned fields, not-submitted notes, and page-reference annotations
+
+### Bookmark Mode
+- Add bookmarks directly from the PDF page
+- Set bookmark title, level, and page number
+- Edit, copy, and delete bookmarks
+- Use bookmarks in final output PDF
 
 ### Review Mode
+- Review annotation and bookmark entries side by side
+- Validate entries before final generation
 
-* Side-by-side view of:
+### Connector Lines
+- Add connector lines separately
+- Move line endpoints after creation
+- Move whole connector lines
+- Connector lines are retained in exported data and final output
 
-  * Annotation table
-  * Bookmark table
-* PDF viewer is hidden for better usability
-* Generate final output PDF
-
-### CSV Support (Multi-User Workflow)
-
-This tool enables **collaborative annotation without access or sharing issues**:
-
-* Users can:
-
-  * Annotate assigned pages independently
-  * Export their annotations as CSV
-* Multiple users can work in parallel without conflicts
-* Final consolidation:
-
-  * Load all CSV files into the tool
-  * Merge annotations seamlessly
-* No dependency on shared file editing or locking mechanisms
+### CSV Import and Export
+- Export annotations to CSV
+- Export bookmarks to CSV
+- Load annotation CSV files
+- Load bookmark CSV files
+- Append multiple CSV files
+- Duplicate checking is supported during load
+- Missing position values can be left blank and adjusted later in the GUI
 
 ---
 
-## Installation
+## Annotation Workflow
 
-### Requirements
+1. Open the source PDF
+2. Go to **Annotation** mode
+3. Click on the page where annotation is needed
+4. Enter metadata in the dialog
+5. Adjust box position if needed
+6. Add bookmarks if needed
+7. Review entries
+8. Generate final output PDF
 
-* Python 3.8 or higher
-* Internet connection (first-time dependency install)
+---
 
-### Run
+## Annotation Types Supported
 
-```bash
-python annotatecrf_studio.py
+### Variable Annotation
+Standard annotation for a collected field.
+
+### Domain Annotation
+Used when the annotation applies to a domain rather than a specific variable.
+
+### Assigned Field
+Adds assigned-field behavior and visual styling.
+
+### Not Submitted
+Creates a standard `[NOT SUBMITTED]` annotation.
+
+### Refer Page
+Creates text like:
+
+`For annotation refer to page X from collected field.`
+
+This can also generate an internal clickable link in the final PDF.
+
+---
+
+## CSV Format
+
+### Annotation CSV columns
+The tool supports these internal annotation columns:
+
+```text
+TYPE,DOMAIN,NAME,PAGENO,ANNOTATION,ASSIGNEDFIELD,X1,Y1,PAGEH,BOX_W,BOX_H,LINE_PAGENO,LINE_X1,LINE_Y1,LINE_X2,LINE_Y2
 ```
 
-Dependencies are automatically installed:
+Core fields:
+- `DOMAIN`
+- `NAME`
+- `PAGENO`
+- `ANNOTATION`
+- `ASSIGNEDFIELD`
 
-* PyMuPDF
-* PyQt5
+Optional fields:
+- `X1`
+- `Y1`
+- `PAGEH`
+- `BOX_W`
+- `BOX_H`
+- line-related columns
 
----
+If `X1`, `Y1`, or `PAGEH` are blank, the tool places the annotation at a default location and you can drag it to the final position manually.
 
-## Usage Workflow
+### Bookmark CSV columns
 
-### 1. Open PDF
-
-* Click **Open PDF**
-* Navigate using **Previous / Next**
-
----
-
-### 2. Annotation Mode
-
-* Select **Annotation**
-* Click on PDF to place annotation
-* Enter:
-
-  * DOMAIN
-  * VARIABLE (optional for domain-level)
-  * ANNOTATION text
-
-Optional selections:
-
-* Domain
-* Assigned Field
-* Not Submitted
-
----
-
-### 3. Bookmark Mode
-
-* Select **Bookmark**
-* Click on page
-* Enter:
-
-  * Bookmark text
-  * Level
-  * Page number
-
----
-
-### 4. Multi-User Annotation (Recommended Workflow)
-
-* Assign pages across team members
-* Each user:
-
-  * Annotates their assigned pages
-  * Exports Annotation CSV
-* Final step:
-
-  * Load all CSV files into a single session
-  * Combine annotations
-  * Perform final review
-
----
-
-### 5. Manage Entries
-
-Use available buttons:
-
-* Export CSV
-* Load CSV
-* Delete selected entry
-
----
-
-### 6. Review
-
-* Switch to **Review**
-* Validate annotation and bookmark tables
-
----
-
-### 7. Generate Output
-
-* Click **Generate Final Output PDF**
-
-Output file:
-
-```
-<input_file_name>_final.pdf
+```text
+TITLE,LEVEL,PAGENO
 ```
 
 ---
 
-## Color Logic
+## Color and Display Behavior
 
-Annotations are colored based on domain appearance order per page:
-
-1st domain → Cyan
-2nd domain → Green
-3rd domain → Peach
-4th domain → Orange
-5th domain → Lavender
-
-
-**Note:**
-Preview colors shown in the tool are temporary. Final output can be aligned with domain-specific standards if required.
+- Domain-based color coding is applied by order of domain appearance on a page
+- The first few domains on a page are color-coded distinctly
+- Assigned fields use dashed borders
+- Not Submitted annotations use dedicated highlighting
+- Text wrapping and box sizing are automatically adjusted
+- Single-line and multi-line annotations are handled differently for cleaner appearance
 
 ---
 
-## CSV Structure
+## Final Output
 
-### Annotation CSV
+The tool can generate a final annotated PDF that includes:
+- Visible annotation boxes
+- Connector lines
+- Bookmarks
+- Internal clickable page-reference links
+- Searchable flattened-style visible content for review workflows
 
-| Column        | Description     |
-| ------------- | --------------- |
-| DOMAIN        | SDTM domain     |
-| NAME          | Variable name   |
-| PAGENO        | Page number     |
-| ANNOTATION    | Annotation text |
-| ASSIGNEDFIELD | Y or blank      |
-| X1            | X coordinate    |
-| Y1            | Y coordinate    |
-| PAGEH         | Page height     |
+The output file can also include exported CSV files for annotations and bookmarks, depending on workflow and usage.
 
 ---
 
-### Bookmark CSV
+## Dependencies
 
-| Column | Description     |
-| ------ | --------------- |
-| TITLE  | Bookmark text   |
-| LEVEL  | Hierarchy level |
-| PAGENO | Page number     |
+The script auto-installs required packages if missing:
 
----
+- `PyMuPDF`
+- `PyQt5`
 
-## Notes
-
-* Single-click annotation placement
-* Review mode hides PDF for better clarity
-* Drag-and-drop supported for annotation repositioning
-* Designed to maximize usable PDF space
-* Well-suited for distributed team workflows
+Because of this, Python must be installed on the machine before running the tool.
 
 ---
 
-## Limitations
+## Platform Notes
 
-* Annotation import requires X1, Y1, and PAGEH
-* Domain colors are assigned per page (not globally fixed)
-* Editing entries is not currently supported (delete and re-add)
+### Windows
+- `.pyw` is the recommended launch file
+- `pythonw.exe` should be associated with `.pyw`
+- A BAT launcher can be used for easier team access
+
+### macOS
+- Python setup may differ depending on system Python and Homebrew Python
+- Package installation and GUI behavior may vary slightly across environments
 
 ---
 
-## Future Enhancements
+## Recommended Folder Setup
 
-* Edit existing annotations and bookmarks
-* Fixed domain-to-color mapping across entire document
-* Template-based annotation loading
-* Domain-specific formatting rules
-* Batch processing support
+```text
+AnnotateCRF-Studio/
+│
+├── run_annotatecrf.bat
+└── app/
+    ├── annotatecrf_studio.pyw
+    ├── annotator_icon.ico
+    ├── annotator_icon.png
+    └── other supporting files
+```
+
+This structure keeps the launcher separate from the application files.
+
+---
+
+## Troubleshooting
+
+### The `.pyw` file does not open on double-click
+The `.pyw` association is not configured. Associate it with `pythonw.exe`.
+
+### A black console window appears
+The file is being opened using `python.exe` instead of `pythonw.exe`.
+
+### The app opens but icon does not appear
+Make sure the icon file is in the same folder as the script and named as expected, such as:
+- `annotator_icon.ico`
+- `annotator_icon.png`
+
+### CSV loads but entries do not appear where expected
+If position columns are blank or different from the target PDF layout, the tool may place annotations at a default position. Drag them to the final location.
+
+### App fails on another machine
+Check:
+- Python is installed
+- Required packages can be installed
+- `.pyw` is associated correctly
+- file permissions allow reading and writing PDFs and CSVs
+
+---
+
+## Best Practice for Team Use
+
+For personal use:
+- Double-click `annotatecrf_studio.pyw`
+
+For team or server use:
+- Keep a BAT launcher
+- Or package the app as an EXE for easier deployment
 
 ---
 
@@ -249,11 +273,21 @@ Preview colors shown in the tool are temporary. Final output can be aligned with
 
 For queries, suggestions, or issues:
 
-[Manivannan.Mathi@outlook.com](mailto:Manivannan.Mathi@outlook.com)
+**Manivannan.Mathialagan@veristat.com**
 
 ---
 
-## License
+## Summary
 
-No external licensing required.
-Designed for internal and organizational use (customize as needed).
+AnnotateCRF Studio is a desktop utility for annotation and bookmarking of PDFs for aCRF workflows.
+
+It provides:
+- PDF annotation
+- Bookmark creation
+- CSV import and export
+- multi-user collaboration support
+- final annotated PDF generation
+- a GUI workflow without requiring Adobe-based editing tools
+
+Preferred launch method:
+- Double-click `annotatecrf_studio.pyw`

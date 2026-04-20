@@ -1,32 +1,64 @@
 # ====================================================================================================
 # Script Name    : annotatecrf_studio.py
 #
-# Description    :
-#                  Desktop GUI utility for capturing annotation positions from a PDF and generating
+# Description    : Desktop GUI utility for capturing annotation positions from a PDF and generating
 #                  final visible comment boxes directly into a PDF without XFDF / Adobe dependency.
 #
-# Version        : full updated script with append + duplicate-check CSV load fixes
+# Version        : full updated script with annotation/bookmark management, TOC support,
+#                  refer-page hyperlink correction, and CSV append/duplicate-check fixes
+#
+#                  Key Updates / Enhancements:
+#                    [1] Added annotation copy option
+#                    [2] Added annotation edit option
+#                    [3] Added bookmark copy option
+#                    [4] Added bookmark edit option
+#                    [5] Added clickable TOC generation
+#                    [6] Added refer-page annotation option
+#                    [7] Added internal page hyperlinks for refer-page annotations
+#                    [8] Fixed refer-page hyperlink target when TOC pages are inserted
+#                    [9] Added page number adjustment when TOC is added
+#                   [10] Added bookmark ordering / branch placement update support
+#                   [11] Added export of three CSV outputs for review and reuse
+#                   [12] Added append load support for CSVs
+#                   [13] Added duplicate-check handling during CSV load
+#                   [14] Allowed annotation CSV import even when position fields are blank
+#                   [15] Improved annotation box sizing, wrapping, and preview behavior
+#                   [16] Added connector line support and editing
+#                   [17] Added page jump / go-to-page navigation
+#                   [18] Added multi-selection copy support for annotations
 #
 #                  Workflow:
 #                    - Open PDF first
 #                    - Annotation mode:
 #                        * Click on PDF -> enter details -> preview box appears immediately
 #                        * Drag an existing preview box to move it
+#                        * Copy / edit / delete annotation rows
 #                        * Manage annotation rows + export/load CSV
 #                    - Bookmark mode:
 #                        * Click on PDF -> enter bookmark details for current page
+#                        * Copy / edit / delete bookmark rows
 #                        * Manage bookmark rows + export/load CSV
 #                    - Review mode:
 #                        * View annotation and bookmark tables side by side
+#                        * Add TOC if needed
 #                        * Generate Final Output PDF
 #
 #                  Annotation CSV columns used internally:
-#                    DOMAIN,NAME,PAGENO,ANNOTATION,ASSIGNEDFIELD,X1,Y1,PAGEH
+#                    TYPE, DOMAIN, NAME, PAGENO, ANNOTATION, ASSIGNEDFIELD,
+#                    X1, Y1, PAGEH, BOX_W, BOX_H,
+#                    LINE_PAGENO, LINE_X1, LINE_Y1, LINE_X2, LINE_Y2
+#
 #                    X1/Y1/PAGEH may be left blank during import; the tool will place the
 #                    annotation at a default location and it can then be dragged manually.
 #
 #                  Bookmark CSV columns used internally:
-#                    TITLE,LEVEL,PAGENO
+#                    TITLE, LEVEL, PAGENO
+#
+#                  Output Files:
+#                    - Final annotated PDF
+#                    - Annotation CSV
+#                    - Bookmark CSV
+#                    - Connector line CSV / details export (if applicable)
 # ====================================================================================================
 
 import csv
@@ -399,7 +431,7 @@ def compute_output_box_height(text_lines, width, bold, font_size, base_h):
     )
 
 
-def draw_box_and_text_pdf(page, rect, text_lines, fill_color, bold=False, dashed=False, font_size=10):
+def draw_box_and_text_pdf(page, rect, text_lines, fill_color, bold=False, dashed=False, font_size=10, link_target_page=None):
     page.draw_rect(rect, color=None, fill=fill_color, overlay=True)
 
     dashes = "[3 3] 0" if dashed else None
@@ -407,7 +439,7 @@ def draw_box_and_text_pdf(page, rect, text_lines, fill_color, bold=False, dashed
 
     fontname = FONT_BOLD if bold else FONT_NORMAL
     full_text = "\n".join(text_lines or [])
-    page_ref = extract_page_reference(full_text)
+    page_ref = int(link_target_page) if link_target_page else extract_page_reference(full_text)
 
     line_count = max(1, len(text_lines or []))
     if line_count == 1:
@@ -924,7 +956,7 @@ class AnnotationDialog(QtWidgets.QDialog):
         ref_page = int(self.ref_page_spin.value())
         self.domain_edit.setText("REF")
         self.name_edit.setText("REF")
-        self.annotation_edit.setPlainText(f"For annotation refer to page {ref_page} from collected field.")
+        self.annotation_edit.setPlainText(f"For annotation details, refer to page {ref_page}.")
 
     def on_ref_page_changed(self):
         if self.chk_refpage.isChecked():
@@ -980,7 +1012,7 @@ class AnnotationDialog(QtWidgets.QDialog):
             self.domain_edit.clear()
         if self.name_edit.text().strip().upper() == "REF":
             self.name_edit.clear()
-        if self.annotation_edit.toPlainText().replace("\t", "    ").rstrip().upper().startswith("FOR ANNOTATION REFER TO PAGE "):
+        if self.annotation_edit.toPlainText().replace("\t", "    ").rstrip().upper().startswith("FOR ANNOTATION DETAILS, REFER TO PAGE"):
             self.annotation_edit.clear()
 
         self.lbl_name.setVisible(not is_domain)
@@ -1043,7 +1075,7 @@ class AnnotationDialog(QtWidgets.QDialog):
             return {
                 "domain": "REF",
                 "name": "REF",
-                "annotation": f"For annotation refer to page {ref_page} from collected field.",
+                "annotation": f"For annotation details, refer to page {ref_page}.",
                 "assignedfield": "",
                 "is_domain_annotation": False,
                 "is_assigned_field": False,
@@ -1076,17 +1108,21 @@ class AnnotationDialog(QtWidgets.QDialog):
 # Dialog for bookmark details
 # ================================
 class BookmarkDialog(QtWidgets.QDialog):
-    def __init__(self, page_no: int, parent=None, initial_data=None, dialog_title="Bookmark Details"):
+    def __init__(self, page_no: int, parent=None, initial_data=None, dialog_title="Bookmark Details",
+                 bookmark_choices=None, keep_order_default=False):
         super().__init__(parent)
         self.setWindowTitle(dialog_title)
-        self.resize(760, 330)
-        self.setMinimumSize(760, 330)
+        self.resize(860, 420)
+        self.setMinimumSize(860, 420)
         self.setModal(True)
+
+        self.bookmark_choices = list(bookmark_choices or [])
+        self.keep_order_default = bool(keep_order_default)
 
         self.setStyleSheet("""
             QDialog { background-color: #f4f8ff; border-radius: 14px; }
             QLabel { font-family: 'Times New Roman'; font-size: 12pt; color: #1c2e4a; }
-            QLineEdit, QSpinBox {
+            QLineEdit, QSpinBox, QComboBox {
                 background: #ffffff; border: 1px solid #a8bfdc; border-radius: 8px;
                 padding: 6px 8px; font-family: 'Times New Roman'; font-size: 12pt; color: #1a1a1a;
             }
@@ -1115,6 +1151,15 @@ class BookmarkDialog(QtWidgets.QDialog):
         self.page_spin.setRange(1, 999999)
         self.page_spin.setValue(page_no)
 
+        self.place_after_combo = QtWidgets.QComboBox()
+        self.place_after_combo.setMinimumWidth(470)
+        if self.keep_order_default:
+            self.place_after_combo.addItem("Keep current order", "__KEEP__")
+        else:
+            self.place_after_combo.addItem("Add at end", "__END__")
+        for idx, label in self.bookmark_choices:
+            self.place_after_combo.addItem(label, idx)
+
         form = QtWidgets.QFormLayout()
         form.setLabelAlignment(QtCore.Qt.AlignRight)
         form.setHorizontalSpacing(18)
@@ -1122,8 +1167,13 @@ class BookmarkDialog(QtWidgets.QDialog):
         form.addRow("Bookmark Text", self.title_edit)
         form.addRow("Level", self.level_spin)
         form.addRow("Page No", self.page_spin)
+        form.addRow("Insert After Branch", self.place_after_combo)
 
-        note = QtWidgets.QLabel("Bookmark will be added to the PDF outline for the selected page.")
+        note = QtWidgets.QLabel(
+            "Use 'Insert After Branch' to place the bookmark under the correct bookmark tree. "
+            "If you select a bookmark, the new or edited bookmark will be inserted after that bookmark "
+            "and all of its child bookmarks."
+        )
         note.setWordWrap(True)
         note.setStyleSheet("QLabel { color: #556b84; font-size: 11pt; font-style: italic; }")
 
@@ -1149,6 +1199,20 @@ class BookmarkDialog(QtWidgets.QDialog):
             self.level_spin.setValue(int(initial_data.get("level", 1)))
             self.page_spin.setValue(int(initial_data.get("pageno", page_no)))
 
+            selected_after = initial_data.get("insert_after_branch")
+            if selected_after == "__KEEP__":
+                idx = self.place_after_combo.findData("__KEEP__")
+                if idx >= 0:
+                    self.place_after_combo.setCurrentIndex(idx)
+            elif selected_after == "__END__":
+                idx = self.place_after_combo.findData("__END__")
+                if idx >= 0:
+                    self.place_after_combo.setCurrentIndex(idx)
+            elif selected_after is not None:
+                idx = self.place_after_combo.findData(selected_after)
+                if idx >= 0:
+                    self.place_after_combo.setCurrentIndex(idx)
+
     def validate_and_accept(self):
         if not self.title_edit.text().strip():
             QtWidgets.QMessageBox.warning(self, "Validation", "Bookmark Text is required.")
@@ -1159,7 +1223,8 @@ class BookmarkDialog(QtWidgets.QDialog):
         return {
             "title": self.title_edit.text().strip(),
             "level": int(self.level_spin.value()),
-            "pageno": int(self.page_spin.value())
+            "pageno": int(self.page_spin.value()),
+            "insert_after_branch": self.place_after_combo.currentData()
         }
 
 
@@ -1641,6 +1706,24 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.btn_prev.setEnabled(False)
         self.btn_next.setEnabled(False)
 
+        self.page_jump_spin = QtWidgets.QSpinBox()
+        self.page_jump_spin.setRange(1, 1)
+        self.page_jump_spin.setValue(1)
+        self.page_jump_spin.setEnabled(False)
+        self.page_jump_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        self.page_jump_spin.setAlignment(QtCore.Qt.AlignCenter)
+        self.page_jump_spin.setFixedWidth(90)
+        self.page_jump_spin.setStyleSheet("""
+            QSpinBox {
+                background: #ffffff; color: #12608d; border: 1px solid #b8cfe4; border-radius: 8px;
+                padding: 5px 8px; font-family: 'Times New Roman'; font-size: 11pt; font-weight: bold;
+            }
+        """)
+
+        self.btn_go_page = mkbtn("Go", "#0284c7", "#0ea5e9")
+        self.btn_go_page.setMinimumWidth(80)
+        self.btn_go_page.setEnabled(False)
+
         self.page_info = QtWidgets.QLabel("Page: -")
         self.page_info.setStyleSheet("""
             QLabel {
@@ -1654,6 +1737,8 @@ class AnnotatorApp(QtWidgets.QWidget):
         top_row.addWidget(self.btn_open)
         top_row.addWidget(self.btn_prev)
         top_row.addWidget(self.btn_next)
+        top_row.addWidget(self.page_jump_spin)
+        top_row.addWidget(self.btn_go_page)
         top_row.addStretch()
         top_row.addWidget(self.btn_terminate)
         top_row.addWidget(self.page_info)
@@ -1740,7 +1825,7 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.annotation_table = QtWidgets.QTableWidget(0, 5)
         self.annotation_table.setHorizontalHeaderLabels(["DOMAIN", "NAME", "PAGENO", "ANNOTATION", "ASSIGNED\nFIELD"])
         self.annotation_table.setSelectionBehavior(QtWidgets.QTableWidget.SelectRows)
-        self.annotation_table.setSelectionMode(QtWidgets.QTableWidget.SingleSelection)
+        self.annotation_table.setSelectionMode(QtWidgets.QTableWidget.ExtendedSelection)
         self.annotation_table.setEditTriggers(QtWidgets.QTableWidget.NoEditTriggers)
         self.annotation_table.setAlternatingRowColors(True)
         self.annotation_table.verticalHeader().setDefaultSectionSize(28)
@@ -1939,6 +2024,8 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.btn_open.clicked.connect(self.open_pdf)
         self.btn_prev.clicked.connect(self.prev_page)
         self.btn_next.clicked.connect(self.next_page)
+        self.btn_go_page.clicked.connect(self.go_to_page)
+        self.page_jump_spin.editingFinished.connect(self.go_to_page)
         self.btn_terminate.clicked.connect(self.close)
 
         self.btn_annotation.clicked.connect(lambda: self.switch_mode("annotation"))
@@ -2065,6 +2152,8 @@ class AnnotatorApp(QtWidgets.QWidget):
         has_pdf = self.doc is not None
         self.btn_prev.setEnabled(has_pdf and self.current_page_index > 0)
         self.btn_next.setEnabled(has_pdf and self.current_page_index < len(self.doc) - 1)
+        self.page_jump_spin.setEnabled(has_pdf)
+        self.btn_go_page.setEnabled(has_pdf)
 
     def check_review_enable(self):
         self.btn_review.setEnabled(self.has_annotation or self.has_bookmark)
@@ -2099,6 +2188,8 @@ class AnnotatorApp(QtWidgets.QWidget):
             self.btn_bookmark.setEnabled(True)
             self.btn_line_mode.setEnabled(False)
             self.btn_clear_line.setEnabled(False)
+            self.page_jump_spin.setRange(1, len(self.doc))
+            self.page_jump_spin.setValue(1)
             self.check_review_enable()
 
             self.refresh_annotation_table()
@@ -2126,6 +2217,9 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.image_label.update()
 
         self.page_info.setText(f"Page: {self.current_page_index + 1} / {len(self.doc)}")
+        self.page_jump_spin.blockSignals(True)
+        self.page_jump_spin.setValue(self.current_page_index + 1)
+        self.page_jump_spin.blockSignals(False)
         self.update_navigation_buttons()
 
     def prev_page(self):
@@ -2137,6 +2231,16 @@ class AnnotatorApp(QtWidgets.QWidget):
     def next_page(self):
         if self.doc and self.current_page_index < len(self.doc) - 1:
             self.current_page_index += 1
+            self.image_label.last_click_point = None
+            self.render_page()
+
+    def go_to_page(self):
+        if not self.doc:
+            return
+        target_page = int(self.page_jump_spin.value())
+        target_page = max(1, min(len(self.doc), target_page))
+        if self.current_page_index != target_page - 1:
+            self.current_page_index = target_page - 1
             self.image_label.last_click_point = None
             self.render_page()
 
@@ -2195,11 +2299,75 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.has_annotation = True
         self.check_review_enable()
 
+    def get_bookmark_choice_items(self, exclude_index=None):
+        items = []
+        for idx, bm in enumerate(self.bookmarks):
+            if exclude_index is not None and idx == exclude_index:
+                continue
+            indent = "    " * max(0, int(bm.level) - 1)
+            label = f"L{int(bm.level)} | {indent}{bm.title} (Page {int(bm.pageno)})"
+            items.append((idx, label))
+        return items
+
+    def get_branch_insert_position(self, bookmark_index):
+        if bookmark_index is None:
+            return len(self.bookmarks)
+        if bookmark_index < 0 or bookmark_index >= len(self.bookmarks):
+            return len(self.bookmarks)
+        parent_level = max(1, int(self.bookmarks[bookmark_index].level))
+        insert_pos = bookmark_index + 1
+        while insert_pos < len(self.bookmarks) and int(self.bookmarks[insert_pos].level) > parent_level:
+            insert_pos += 1
+        return insert_pos
+
+    def insert_bookmark_by_choice(self, bookmark, insert_after_branch):
+        if insert_after_branch in (None, "__END__", "__KEEP__"):
+            self.bookmarks.append(bookmark)
+            return len(self.bookmarks) - 1
+        try:
+            target_index = int(insert_after_branch)
+        except Exception:
+            self.bookmarks.append(bookmark)
+            return len(self.bookmarks) - 1
+        insert_pos = self.get_branch_insert_position(target_index)
+        self.bookmarks.insert(insert_pos, bookmark)
+        return insert_pos
+
+    def move_existing_bookmark_by_choice(self, current_index, insert_after_branch):
+        if current_index < 0 or current_index >= len(self.bookmarks):
+            return current_index
+        if insert_after_branch in (None, "__KEEP__"):
+            return current_index
+
+        bookmark = self.bookmarks.pop(current_index)
+
+        if insert_after_branch == "__END__":
+            self.bookmarks.append(bookmark)
+            return len(self.bookmarks) - 1
+
+        try:
+            target_index = int(insert_after_branch)
+        except Exception:
+            self.bookmarks.insert(current_index, bookmark)
+            return current_index
+
+        if target_index > current_index:
+            target_index -= 1
+
+        insert_pos = self.get_branch_insert_position(target_index)
+        self.bookmarks.insert(insert_pos, bookmark)
+        return insert_pos
+
     def capture_bookmark_point(self):
         if not self.doc:
             return
 
-        dlg = BookmarkDialog(self.current_page_index + 1, self)
+        dlg = BookmarkDialog(
+            self.current_page_index + 1,
+            self,
+            bookmark_choices=self.get_bookmark_choice_items(),
+            keep_order_default=False
+        )
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
             return
 
@@ -2209,8 +2377,10 @@ class AnnotatorApp(QtWidgets.QWidget):
             level=vals["level"],
             pageno=vals["pageno"]
         )
-        self.bookmarks.append(bm)
-        self.selected_bookmark_index = len(self.bookmarks) - 1
+        self.selected_bookmark_index = self.insert_bookmark_by_choice(
+            bm,
+            vals.get("insert_after_branch")
+        )
 
         self.refresh_bookmark_table()
         self.refresh_review_tables()
@@ -2269,11 +2439,19 @@ class AnnotatorApp(QtWidgets.QWidget):
             self.select_annotation_row_silent(self.selected_entry_index)
         self.update_annotation_action_buttons()
 
+    def get_selected_annotation_rows(self):
+        model = self.annotation_table.selectionModel()
+        if model is None:
+            return []
+        rows = sorted({idx.row() for idx in model.selectedRows() if 0 <= idx.row() < len(self.entries)})
+        return rows
+
     def on_annotation_selection_changed(self):
         if self._suppress_annotation_selection_signal:
             return
 
-        row = self.annotation_table.currentRow()
+        selected_rows = self.get_selected_annotation_rows()
+        row = selected_rows[0] if selected_rows else self.annotation_table.currentRow()
         if 0 <= row < len(self.entries):
             self.selected_entry_index = row
             self.selected_line_index = -1
@@ -2298,9 +2476,14 @@ class AnnotatorApp(QtWidgets.QWidget):
                 self.render_page()
 
     def update_annotation_action_buttons(self):
-        has_selection = 0 <= self.selected_entry_index < len(self.entries)
-        self.btn_edit_ann.setEnabled(has_selection)
-        self.btn_copy_ann.setEnabled(has_selection)
+        selected_rows = self.get_selected_annotation_rows()
+        selected_count = len(selected_rows)
+        has_single_selection = selected_count == 1 and 0 <= self.selected_entry_index < len(self.entries)
+        has_any_selection = selected_count > 0 or (0 <= self.selected_entry_index < len(self.entries))
+        self.btn_edit_ann.setEnabled(has_single_selection)
+        self.btn_delete_ann.setEnabled(has_single_selection)
+        self.btn_copy_ann.setEnabled(has_any_selection)
+        self.btn_copy_ann_page.setEnabled(bool(self.pdf_loaded and has_any_selection))
         self.btn_line_mode.setEnabled(bool(self.pdf_loaded))
         self.btn_clear_line.setEnabled(bool(self.pdf_loaded and (self.lines or self.selected_line_index >= 0)))
 
@@ -2487,70 +2670,123 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.check_review_enable()
 
     def copy_selected_annotation(self):
-        row = self.annotation_table.currentRow()
-        if row < 0 or row >= len(self.entries):
-            QtWidgets.QMessageBox.information(self, "Copy Annotation", "Please select an annotation row to copy.")
+        selected_rows = self.get_selected_annotation_rows()
+        if not selected_rows and 0 <= self.annotation_table.currentRow() < len(self.entries):
+            selected_rows = [self.annotation_table.currentRow()]
+        if not selected_rows:
+            QtWidgets.QMessageBox.information(self, "Copy Annotation", "Please select one or more annotation rows to copy.")
             return
 
-        src = self.entries[row]
-        dlg = AnnotationDialog(self, initial_data=self.annotation_entry_to_dialog_data(src), dialog_title="Copy Annotation")
-        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+        if len(selected_rows) == 1:
+            row = selected_rows[0]
+            src = self.entries[row]
+            dlg = AnnotationDialog(self, initial_data=self.annotation_entry_to_dialog_data(src), dialog_title="Copy Annotation")
+            if dlg.exec_() != QtWidgets.QDialog.Accepted:
+                return
+
+            vals = dlg.get_values()
+            x1 = round(src.x1 + 8.0, 6)
+            y1 = round(src.y1 + 8.0, 6)
+            if self.page_rect:
+                x1 = round(min(x1, max(0.0, self.page_rect.width - MIN_BOX_WIDTH_SINGLE - RIGHT_PAGE_MARGIN)), 6)
+                y1 = round(min(y1, max(0.0, self.page_rect.height - BOX_HEIGHT_NORMAL - 6.0)), 6)
+
+            new_entry = AnnotationEntry(
+                domain=vals["domain"],
+                name=vals["name"],
+                pageno=src.pageno,
+                annotation=vals["annotation"],
+                assignedfield=vals["assignedfield"],
+                x1=x1,
+                y1=y1,
+                pageh=src.pageh,
+                is_domain_annotation=vals["is_domain_annotation"],
+                is_assigned_field=vals["is_assigned_field"],
+                is_not_submitted=vals["is_not_submitted"],
+                box_w=None,
+                box_h=None,
+                line_x1=None,
+                line_y1=None,
+                line_x2=None,
+                line_y2=None
+            )
+            self.entries.append(new_entry)
+            self.selected_entry_index = len(self.entries) - 1
+            self.refresh_annotation_table()
+            self.refresh_review_tables()
+            self.select_annotation_row_silent(self.selected_entry_index)
+            self.image_label.update()
+            self.has_annotation = True
+            self.check_review_enable()
             return
 
-        vals = dlg.get_values()
-        x1 = round(src.x1 + 8.0, 6)
-        y1 = round(src.y1 + 8.0, 6)
-        if self.page_rect:
-            x1 = round(min(x1, max(0.0, self.page_rect.width - MIN_BOX_WIDTH_SINGLE - RIGHT_PAGE_MARGIN)), 6)
-            y1 = round(min(y1, max(0.0, self.page_rect.height - BOX_HEIGHT_NORMAL - 6.0)), 6)
+        added_rows = []
+        per_copy_shift = 8.0
+        for offset_index, row in enumerate(selected_rows, start=1):
+            src = self.entries[row]
+            x1 = float(src.x1) + (per_copy_shift * offset_index)
+            y1 = float(src.y1) + (per_copy_shift * offset_index)
+            page_w = float(self.doc[src.pageno - 1].rect.width) if self.doc else (self.page_rect.width if self.page_rect else 999999)
+            page_h = float(self.doc[src.pageno - 1].rect.height) if self.doc else src.pageh
+            x1 = round(min(max(0.0, x1), max(0.0, page_w - MIN_BOX_WIDTH_SINGLE - RIGHT_PAGE_MARGIN)), 6)
+            y1 = round(min(max(0.0, y1), max(0.0, page_h - BOX_HEIGHT_NORMAL - 6.0)), 6)
 
-        new_entry = AnnotationEntry(
-            domain=vals["domain"],
-            name=vals["name"],
-            pageno=src.pageno,
-            annotation=vals["annotation"],
-            assignedfield=vals["assignedfield"],
-            x1=x1,
-            y1=y1,
-            pageh=src.pageh,
-            is_domain_annotation=vals["is_domain_annotation"],
-            is_assigned_field=vals["is_assigned_field"],
-            is_not_submitted=vals["is_not_submitted"],
-            box_w=None,
-            box_h=None,
-            line_x1=None,
-            line_y1=None,
-            line_x2=None,
-            line_y2=None
-        )
-        self.entries.append(new_entry)
-        self.selected_entry_index = len(self.entries) - 1
+            new_entry = AnnotationEntry(
+                domain=src.domain,
+                name=src.name,
+                pageno=src.pageno,
+                annotation=src.annotation,
+                assignedfield=src.assignedfield,
+                x1=x1,
+                y1=y1,
+                pageh=src.pageh,
+                is_domain_annotation=src.is_domain_annotation,
+                is_assigned_field=src.is_assigned_field,
+                is_not_submitted=src.is_not_submitted,
+                box_w=src.box_w,
+                box_h=src.box_h,
+                line_x1=None,
+                line_y1=None,
+                line_x2=None,
+                line_y2=None
+            )
+            self.entries.append(new_entry)
+            added_rows.append(len(self.entries) - 1)
+
+        self.selected_entry_index = added_rows[-1] if added_rows else -1
         self.refresh_annotation_table()
         self.refresh_review_tables()
-        self.select_annotation_row_silent(self.selected_entry_index)
+        if self.selected_entry_index >= 0:
+            self.select_annotation_row_silent(self.selected_entry_index)
         self.image_label.update()
-        self.has_annotation = True
+        self.has_annotation = len(self.entries) > 0
         self.check_review_enable()
+        QtWidgets.QMessageBox.information(self, "Copy Annotation", f"{len(added_rows)} annotations copied on their current pages.")
 
     def copy_annotation_to_page(self):
-        row = self.annotation_table.currentRow()
-        if row < 0 or row >= len(self.entries):
-            QtWidgets.QMessageBox.information(self, "Copy Annotation To Page", "Please select an annotation row to copy.")
+        selected_rows = self.get_selected_annotation_rows()
+        if not selected_rows and 0 <= self.annotation_table.currentRow() < len(self.entries):
+            selected_rows = [self.annotation_table.currentRow()]
+        if not selected_rows:
+            QtWidgets.QMessageBox.information(self, "Copy Annotation To Page", "Please select one or more annotation rows to copy.")
             return
         if not self.doc:
             QtWidgets.QMessageBox.information(self, "Copy Annotation To Page", "Please open a PDF first.")
             return
 
-        src = self.entries[row]
-        dlg = AnnotationDialog(self, initial_data=self.annotation_entry_to_dialog_data(src), dialog_title="Copy Annotation To Page")
-        if dlg.exec_() != QtWidgets.QDialog.Accepted:
-            return
-        vals = dlg.get_values()
+        sources = [self.entries[row] for row in selected_rows]
+        src = sources[0]
+        vals = None
+        if len(sources) == 1:
+            dlg = AnnotationDialog(self, initial_data=self.annotation_entry_to_dialog_data(src), dialog_title="Copy Annotation To Page")
+            if dlg.exec_() != QtWidgets.QDialog.Accepted:
+                return
+            vals = dlg.get_values()
 
         opt = QtWidgets.QDialog(self)
         opt.setWindowTitle("Copy Annotation To Page")
         opt.setModal(True)
-        opt.resize(420, 220)
+        opt.resize(460, 260)
         opt.setStyleSheet("""
             QDialog { background-color: #f4f8ff; border-radius: 14px; }
             QLabel { font-family: 'Times New Roman'; font-size: 12pt; color: #1c2e4a; }
@@ -2595,6 +2831,12 @@ class AnnotatorApp(QtWidgets.QWidget):
         form.addRow("", offset_chk)
         vbox.addLayout(form)
 
+        if len(sources) > 1:
+            multi_note = QtWidgets.QLabel(f"{len(sources)} selected annotations will be copied together with their own text and metadata.")
+            multi_note.setWordWrap(True)
+            multi_note.setStyleSheet("QLabel { color: #22543d; font-size: 11pt; font-style: italic; }")
+            vbox.addWidget(multi_note)
+
         note = QtWidgets.QLabel("Connector lines are not copied automatically. You can draw a new line after copying if needed.")
         note.setWordWrap(True)
         note.setStyleSheet("QLabel { color: #556b84; font-size: 11pt; font-style: italic; }")
@@ -2617,45 +2859,67 @@ class AnnotatorApp(QtWidgets.QWidget):
         target_page_w = float(target_page_obj.rect.width)
         target_page_h = float(target_page_obj.rect.height)
 
-        if keep_pos_chk.isChecked():
-            new_x1 = float(src.x1)
-            new_y1 = float(src.y1)
-            if target_page == src.pageno and offset_chk.isChecked():
-                new_x1 += 8.0
-                new_y1 += 8.0
-        else:
-            new_x1 = 40.0
-            new_y1 = 40.0
+        added_rows = []
+        for offset_index, src in enumerate(sources, start=1):
+            if keep_pos_chk.isChecked():
+                new_x1 = float(src.x1)
+                new_y1 = float(src.y1)
+                if target_page == src.pageno and offset_chk.isChecked():
+                    new_x1 += 8.0 * offset_index
+                    new_y1 += 8.0 * offset_index
+            else:
+                new_x1 = 40.0 + (8.0 * (offset_index - 1))
+                new_y1 = 40.0 + (8.0 * (offset_index - 1))
 
-        max_w = max(0.0, target_page_w - MIN_BOX_WIDTH_SINGLE - RIGHT_PAGE_MARGIN)
-        max_h = max(0.0, target_page_h - BOX_HEIGHT_NORMAL - 6.0)
-        new_x1 = round(min(max(0.0, new_x1), max_w), 6)
-        new_y1 = round(min(max(0.0, new_y1), max_h), 6)
+            max_w = max(0.0, target_page_w - MIN_BOX_WIDTH_SINGLE - RIGHT_PAGE_MARGIN)
+            max_h = max(0.0, target_page_h - BOX_HEIGHT_NORMAL - 6.0)
+            new_x1 = round(min(max(0.0, new_x1), max_w), 6)
+            new_y1 = round(min(max(0.0, new_y1), max_h), 6)
 
-        new_entry = AnnotationEntry(
-            domain=vals["domain"],
-            name=vals["name"],
-            pageno=target_page,
-            annotation=vals["annotation"],
-            assignedfield=vals["assignedfield"],
-            x1=new_x1,
-            y1=new_y1,
-            pageh=target_page_h,
-            is_domain_annotation=vals["is_domain_annotation"],
-            is_assigned_field=vals["is_assigned_field"],
-            is_not_submitted=vals["is_not_submitted"],
-            box_w=src.box_w,
-            box_h=src.box_h,
-            line_x1=None,
-            line_y1=None,
-            line_x2=None,
-            line_y2=None
-        )
-        self.entries.append(new_entry)
-        self.selected_entry_index = len(self.entries) - 1
+            if vals is not None:
+                domain = vals["domain"]
+                name = vals["name"]
+                annotation = vals["annotation"]
+                assignedfield = vals["assignedfield"]
+                is_domain_annotation = vals["is_domain_annotation"]
+                is_assigned_field = vals["is_assigned_field"]
+                is_not_submitted = vals["is_not_submitted"]
+            else:
+                domain = src.domain
+                name = src.name
+                annotation = src.annotation
+                assignedfield = src.assignedfield
+                is_domain_annotation = src.is_domain_annotation
+                is_assigned_field = src.is_assigned_field
+                is_not_submitted = src.is_not_submitted
+
+            new_entry = AnnotationEntry(
+                domain=domain,
+                name=name,
+                pageno=target_page,
+                annotation=annotation,
+                assignedfield=assignedfield,
+                x1=new_x1,
+                y1=new_y1,
+                pageh=target_page_h,
+                is_domain_annotation=is_domain_annotation,
+                is_assigned_field=is_assigned_field,
+                is_not_submitted=is_not_submitted,
+                box_w=src.box_w,
+                box_h=src.box_h,
+                line_x1=None,
+                line_y1=None,
+                line_x2=None,
+                line_y2=None
+            )
+            self.entries.append(new_entry)
+            added_rows.append(len(self.entries) - 1)
+
+        self.selected_entry_index = added_rows[-1] if added_rows else -1
         self.refresh_annotation_table()
         self.refresh_review_tables()
-        self.select_annotation_row_silent(self.selected_entry_index)
+        if self.selected_entry_index >= 0:
+            self.select_annotation_row_silent(self.selected_entry_index)
         self.has_annotation = True
         self.check_review_enable()
 
@@ -2665,13 +2929,17 @@ class AnnotatorApp(QtWidgets.QWidget):
         else:
             self.image_label.update()
 
-        QtWidgets.QMessageBox.information(self, "Copy Annotation To Page", f"Annotation copied to page {target_page}.")
+        if len(added_rows) == 1:
+            QtWidgets.QMessageBox.information(self, "Copy Annotation To Page", f"Annotation copied to page {target_page}.")
+        else:
+            QtWidgets.QMessageBox.information(self, "Copy Annotation To Page", f"{len(added_rows)} annotations copied to page {target_page}.")
 
     def bookmark_entry_to_dialog_data(self, entry):
         return {
             "title": entry.title,
             "level": entry.level,
             "pageno": entry.pageno,
+            "insert_after_branch": "__KEEP__",
         }
 
     def edit_selected_bookmark(self):
@@ -2681,7 +2949,14 @@ class AnnotatorApp(QtWidgets.QWidget):
             return
 
         bm = self.bookmarks[row]
-        dlg = BookmarkDialog(bm.pageno, self, initial_data=self.bookmark_entry_to_dialog_data(bm), dialog_title="Edit Bookmark")
+        dlg = BookmarkDialog(
+            bm.pageno,
+            self,
+            initial_data=self.bookmark_entry_to_dialog_data(bm),
+            dialog_title="Edit Bookmark",
+            bookmark_choices=self.get_bookmark_choice_items(exclude_index=row),
+            keep_order_default=True
+        )
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
             return
 
@@ -2690,7 +2965,10 @@ class AnnotatorApp(QtWidgets.QWidget):
         bm.level = vals["level"]
         bm.pageno = vals["pageno"]
 
-        self.selected_bookmark_index = row
+        self.selected_bookmark_index = self.move_existing_bookmark_by_choice(
+            row,
+            vals.get("insert_after_branch")
+        )
         self.refresh_bookmark_table()
         self.refresh_review_tables()
         self.select_bookmark_row_silent(row)
@@ -3339,7 +3617,8 @@ class AnnotatorApp(QtWidgets.QWidget):
                         fill_color=layout["fill"],
                         bold=layout["bold"],
                         dashed=layout["dashed"],
-                        font_size=layout["font_size"]
+                        font_size=layout["font_size"],
+                        link_target_page=extract_page_reference(e.annotation)
                     )
 
                     if None not in (e.line_x1, e.line_y1, e.line_x2, e.line_y2):
