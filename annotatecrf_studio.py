@@ -1,68 +1,53 @@
 # ====================================================================================================
-# Script Name    : annotatecrf_studio.py
+# Tool Name      : AnnotateCRF Studio
 #
-# Description    : Desktop GUI utility for capturing annotation positions from a PDF and generating
-#                  final visible comment boxes directly into a PDF without XFDF / Adobe dependency.
+# Description    : GUI-based application for creating submission-ready annotated CRFs
+#                  compliant with CDISC MSG 2.0 standards without requiring Adobe Acrobat,
+#                  third-party PDF annotation software, or subscription-based tools.
 #
-# Version        : full updated script with annotation/bookmark management, TOC support,
-#                  refer-page hyperlink correction, CSV append/duplicate-check fixes,
-#                  and robust CSV export for pythonw/.pyw GUI mode
+# Purpose        : Enables Statistical Programmers and Clinical Data Standards teams to
+#                  efficiently create, review, manage, and publish annotated CRFs with
+#                  support for SDTM metadata integration, bookmarks, hyperlinks,
+#                  annotation management, and final PDF generation.
 #
-#                  Key Updates / Enhancements:
-#                    [1] Added annotation copy option
-#                    [2] Added annotation edit option
-#                    [3] Added bookmark copy option
-#                    [4] Added bookmark edit option
-#                    [5] Added clickable TOC generation
-#                    [6] Added refer-page annotation option
-#                    [7] Added internal page hyperlinks for refer-page annotations
-#                    [8] Fixed refer-page hyperlink target when TOC pages are inserted
-#                    [9] Added page number adjustment when TOC is added
-#                   [10] Added bookmark ordering / branch placement update support
-#                   [11] Added export of three CSV outputs for review and reuse
-#                   [12] Added append load support for CSVs
-#                   [13] Added duplicate-check handling during CSV load
-#                   [14] Allowed annotation CSV import even when position fields are blank
-#                   [15] Improved annotation box sizing, wrapping, and preview behavior
-#                   [16] Added connector line support and editing
-#                   [17] Added page jump / go-to-page navigation
-#                   [18] Added multi-selection copy support for annotations
+# Key Features   :
+#                  • CDISC Library integration for SDTM metadata retrieval
+#                  • Interactive PDF annotation placement
+#                  • Domain, Variable, Assigned Field, and NOTSUB annotations
+#                  • Refer-page annotations with clickable hyperlinks
+#                  • Annotation copy, edit, delete, and multi-select operations
+#                  • Connector line creation and management
+#                  • Bookmark creation, editing, copying, and hierarchy management
+#                  • Automatic Table of Contents generation
+#                  • Clickable PDF bookmarks and internal navigation
+#                  • Annotation and bookmark CSV import/export
+#                  • Review mode with annotation and bookmark management
+#                  • Final publication-ready annotated PDF generation
 #
-#                  Workflow:
-#                    - Open PDF first
-#                    - Annotation mode:
-#                        * Click on PDF -> enter details -> preview box appears immediately
-#                        * Drag an existing preview box to move it
-#                        * Copy / edit / delete annotation rows
-#                        * Manage annotation rows + export/load CSV
-#                    - Bookmark mode:
-#                        * Click on PDF -> enter bookmark details for current page
-#                        * Copy / edit / delete bookmark rows
-#                        * Manage bookmark rows + export/load CSV
-#                    - Review mode:
-#                        * View annotation and bookmark tables side by side
-#                        * Add TOC if needed
-#                        * Generate Final Output PDF
+# Input Files    :
+#                  • Source CRF PDF
+#                  • Annotation CSV (optional)
+#                  • Bookmark CSV (optional)
+#                  • CDISC API Key JSON (optional for metadata integration)
 #
-#                  Annotation CSV columns used internally:
-#                    TYPE, DOMAIN, NAME, PAGENO, ANNOTATION, ASSIGNEDFIELD,
-#                    X1, Y1, PAGEH, BOX_W, BOX_H,
-#                    LINE_PAGENO, LINE_X1, LINE_Y1, LINE_X2, LINE_Y2
+# Output Files   :
+#                  • Final Annotated PDF
+#                  • Annotation CSV
+#                  • Bookmark CSV
+#                  • Connector Line CSV
 #
-#                    X1/Y1/PAGEH may be left blank during import; the tool will place the
-#                    annotation at a default location and it can then be dragged manually.
+# Standards      :
+#                  • CDISC MSG 2.0
+#                  • SDTMIG 3.2 / 3.3 / 3.4
+#                  • CDISC Library API
 #
-#                  Bookmark CSV columns used internally:
-#                    TITLE, LEVEL, PAGENO
+# Developed By   : Manivannan Mathialagan
+# Last Updated   : June 2026
 #
-#                  Output Files:
-#                    - Final annotated PDF
-#                    - Annotation CSV
-#                    - Bookmark CSV
-#                    - Connector line CSV / details export (if applicable)
 # ====================================================================================================
 
 import csv
+import json
 import importlib
 import os
 import re
@@ -118,18 +103,42 @@ _ensure_console_safe_streams()
 REQUIRED_PACKAGES = [
     ("PyMuPDF", "fitz"),
     ("PyQt5", "PyQt5"),
+    ("requests", "requests"),
 ]
+
+def is_packaged_exe():
+    return getattr(sys, "frozen", False)
 
 def install_if_missing(package_name, import_name=None):
     module_name = import_name or package_name
+
     try:
         importlib.import_module(module_name)
+        return
     except ImportError:
-        safe_log(f"[Installing] {package_name} ...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
-        importlib.invalidate_caches()
-        importlib.import_module(module_name)
-        safe_log(f"[Done] {package_name} installed.")
+        pass
+
+    # Never attempt pip install inside a packaged EXE
+    if is_packaged_exe():
+        raise ImportError(
+            f"Required package '{package_name}' is missing from the packaged application. "
+            f"Please install it before rebuilding the EXE."
+        )
+
+    safe_log(f"[Installing] {package_name} ...")
+
+    subprocess.check_call([
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        package_name
+    ])
+
+    importlib.invalidate_caches()
+    importlib.import_module(module_name)
+
+    safe_log(f"[Done] {package_name} installed.")
 
 for package_name, import_name in REQUIRED_PACKAGES:
     install_if_missing(package_name, import_name)
@@ -140,6 +149,7 @@ QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
 QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
 
 import fitz
+import requests
 
 # ================================
 # Settings
@@ -153,12 +163,38 @@ APP_ICON_CANDIDATES = [
 
 DEFAULT_ZOOM = 1.30
 DOMAIN_COLORS = [
-    (0.75, 1.00, 1.00),   # 1st domain on page = cyan
-    (0.59, 1.00, 0.59),   # 2nd domain on page = green
-    (1.00, 0.75, 0.61),   # 3rd domain on page = peach
-    (1.00, 0.80, 0.55),   # 4th domain on page = orange
-    (0.86, 0.82, 1.00),   # 5th domain on page = lavender
+    (0.75, 1.00, 1.00),   # cyan
+    (0.59, 1.00, 0.59),   # green
+    (1.00, 0.75, 0.61),   # peach
+    (1.00, 0.80, 0.55),   # orange
+    (0.86, 0.82, 1.00),   # lavender
 ]
+
+# Stable MSG-style domain colours for GUI preview and final PDF rendering.
+# This avoids the same domain changing colour based on page/order of creation.
+STABLE_DOMAIN_COLOR_MAP = {
+    "DM": (0.75, 1.00, 1.00),     # Blue/Cyan - Demographics
+    "DS": (1.00, 1.00, 0.59),     # Yellow - Disposition
+    "SC": (0.59, 1.00, 0.59),     # Green - Subject Characteristics
+    "VS": (1.00, 0.75, 0.61),     # Orange/Peach - Vital Signs
+    "AE": (1.00, 0.80, 0.55),     # Orange - Adverse Events
+    "CM": (0.86, 0.82, 1.00),     # Lavender - Concomitant Medications
+    "EX": (0.80, 0.90, 1.00),
+    "EC": (0.90, 0.85, 1.00),
+    "LB": (0.80, 1.00, 0.90),
+    "MH": (1.00, 0.90, 0.80),
+    "PR": (0.90, 1.00, 0.80),
+}
+
+def stable_domain_color(domain: str):
+    dom = (domain or "").strip().upper()
+    if not dom:
+        return DEFAULT_OTHER_FILL if "DEFAULT_OTHER_FILL" in globals() else (0.85, 0.85, 0.85)
+    if dom in STABLE_DOMAIN_COLOR_MAP:
+        return STABLE_DOMAIN_COLOR_MAP[dom]
+    # Deterministic fallback for other domains.
+    idx = sum(ord(ch) for ch in dom) % len(DOMAIN_COLORS)
+    return DOMAIN_COLORS[idx]
 DEFAULT_OTHER_FILL = (0.85, 0.85, 0.85)
 NOTSUB_FILL = (1.00, 0.93, 0.55)
 TEXT_COLOR = (0.0, 0.0, 0.0)
@@ -208,6 +244,343 @@ CHAR_WIDTHS = {
     'v': 5.64, 'w': 7.89, 'x': 5.65, 'y': 5.66, 'z': 5.10, '{': 4.01,
     '|': 2.87, '}': 3.98, '~': 5.94, ' ': 2.90
 }
+
+
+# ================================
+# CDISC Library SDTM metadata support
+# ================================
+CDISC_API_BASE = "https://library.cdisc.org/api"
+CDISC_KEY_FILE_CANDIDATES = [
+    os.path.join(SCRIPT_DIR, "CDISC_API_KEY.json"),
+    os.path.join(SCRIPT_DIR, "cdisc_api_key.json"),
+]
+SDTMIG_STANDARD_OPTIONS = ["SDTMIG 3.4", "SDTMIG 3.3", "SDTMIG 3.2"]
+
+
+def safe_text(value):
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def load_cdisc_api_keys_for_sdtm():
+    """Load primary/secondary CDISC Library keys from JSON in the script folder.
+
+    Supported formats:
+      {"cdisc_library": {"primary_key": "...", "secondary_key": "..."}}
+      {"primary_key": "...", "secondary_key": "..."}
+    """
+    last_error = ""
+    for key_file in CDISC_KEY_FILE_CANDIDATES:
+        if not os.path.exists(key_file):
+            continue
+        try:
+            with open(key_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            block = data.get("cdisc_library", data) if isinstance(data, dict) else {}
+            primary = safe_text(block.get("primary_key") or block.get("primary") or block.get("api_key"))
+            secondary = safe_text(block.get("secondary_key") or block.get("secondary"))
+            if primary or secondary:
+                return primary, secondary, key_file
+            last_error = f"No primary_key/secondary_key found in {key_file}"
+        except Exception as e:
+            last_error = f"Unable to read {key_file}: {e}"
+    raise FileNotFoundError(
+        "CDISC API key file was not found or is invalid. Expected CDISC_API_KEY.json in the same folder as this script."
+        + (f"\n{last_error}" if last_error else "")
+    )
+
+
+def cdisc_api_get(path_or_url, primary_key, secondary_key=""):
+    url = safe_text(path_or_url)
+    if not url.startswith("http"):
+        if not url.startswith("/"):
+            url = "/" + url
+        url = CDISC_API_BASE + url
+    errors = []
+    for label, key in [("Primary", primary_key), ("Secondary", secondary_key)]:
+        key = safe_text(key)
+        if not key:
+            continue
+        try:
+            r = requests.get(url, headers={"api-key": key, "Accept": "application/json"}, timeout=90)
+            if r.status_code == 200:
+                return r.json()
+            errors.append(f"{label} {r.status_code}: {r.text[:250]}")
+        except Exception as e:
+            errors.append(f"{label} error: {e}")
+    raise RuntimeError("Unable to access CDISC Library API. " + " | ".join(errors))
+
+
+def iter_json_dicts(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from iter_json_dicts(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from iter_json_dicts(v)
+
+
+def json_first_value(d, keys, default=""):
+    if not isinstance(d, dict):
+        return default
+    lower = {str(k).lower(): k for k in d.keys()}
+    for key in keys:
+        lk = key.lower()
+        if lk in lower:
+            val = d.get(lower[lk])
+            if val not in (None, "", [], {}):
+                return val
+    return default
+
+
+def extract_api_links(data):
+    links = []
+    def add_link(obj, hint=""):
+        if not isinstance(obj, dict):
+            return
+        href = obj.get("href") or obj.get("url") or obj.get("path")
+        title = obj.get("title") or obj.get("name") or obj.get("label") or obj.get("submissionValue") or hint
+        if href:
+            links.append({"href": safe_text(href), "title": safe_text(title)})
+    if isinstance(data, dict):
+        for container_name in ("_links", "_embedded"):
+            cont = data.get(container_name)
+            if isinstance(cont, dict):
+                for k, v in cont.items():
+                    if isinstance(v, list):
+                        for item in v:
+                            add_link(item, k)
+                    elif isinstance(v, dict):
+                        add_link(v, k)
+        # Some CDISC payloads expose plain arrays.
+        for k, v in data.items():
+            if isinstance(v, list) and k.lower() in {"datasets", "domains", "variables", "items"}:
+                for item in v:
+                    add_link(item, k)
+    out, seen = [], set()
+    for link in links:
+        key = (link["href"], link["title"])
+        if key not in seen:
+            seen.add(key)
+            out.append(link)
+    return out
+
+
+def _infer_domain_from_href(href):
+    """Infer SDTM domain from CDISC Library href/source path."""
+    txt = safe_text(href).upper()
+    patterns = [
+        r"/(?:DATASETS|DOMAINS)/([A-Z][A-Z0-9]{1,7})(?:/|$)",
+        r"/(?:DATASET|DOMAIN)/([A-Z][A-Z0-9]{1,7})(?:/|$)",
+        r"[?&](?:DATASET|DOMAIN)=([A-Z][A-Z0-9]{1,7})(?:&|$)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, txt)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _is_actual_sdtm_domain_code(value):
+    """Keep real domain codes only; prevent variable names like AGE/ACTARM/BSTAT becoming domains."""
+    dom = safe_text(value).upper()
+    return bool(
+        re.fullmatch(r"[A-Z][A-Z0-9]{1,3}", dom)
+        or dom == "RELREC"
+        or re.fullmatch(r"SUPP[A-Z0-9]{2,4}", dom)
+        or re.fullmatch(r"SQ[A-Z0-9]{2,4}", dom)
+    )
+
+
+def _looks_like_dataset_record(d):
+    if not isinstance(d, dict):
+        return False
+    keys = {str(k).lower() for k in d.keys()}
+    dataset_keys = {
+        "domain", "dataset", "datasetname", "shortname", "submissionvalue",
+        "class", "structure", "purpose", "datasetlabel", "datasetclass"
+    }
+    variable_keys = {"variable", "variablename", "datatype", "type", "length", "core", "role", "origin"}
+    return bool(keys & dataset_keys) and not bool(keys & variable_keys)
+
+
+def parse_sdtm_domain_and_variable_metadata(payloads):
+    """Return domain_labels and variables_by_domain from CDISC Library SDTMIG payloads.
+
+    Important: CDISC Library variable payloads can contain NAME=AGE, NAME=ACTARM, etc.
+    Those are variables, not domains. This parser uses dataset/domain payloads and href
+    context first, then attaches variable records to the parent dataset/domain.
+    """
+    domain_labels = {}
+    variables_by_domain = {}
+    seen_vars = set()
+
+    def add_domain(dom, label=""):
+        dom = safe_text(dom).upper()
+        label = safe_text(label)
+        if not _is_actual_sdtm_domain_code(dom):
+            return
+        if dom not in domain_labels or (label and domain_labels.get(dom, "") in {"", dom}):
+            domain_labels[dom] = label or domain_labels.get(dom, "") or dom
+
+    def add_variable(dom, var, label="", role="", core=""):
+        dom = safe_text(dom).upper()
+        var = safe_text(var).upper()
+        label = safe_text(label)
+        if not _is_actual_sdtm_domain_code(dom):
+            return
+        if not var or not re.fullmatch(r"[A-Z][A-Z0-9_]{1,20}", var):
+            return
+        if var in {"TERM", "CODE", "CODELIST", "VALUE", "LABEL", "DOMAIN", "DATASET"}:
+            return
+        key = (dom, var)
+        if key in seen_vars:
+            return
+        seen_vars.add(key)
+        variables_by_domain.setdefault(dom, []).append({
+            "domain": dom,
+            "variable": var,
+            "label": label,
+            "role": safe_text(role),
+            "core": safe_text(core),
+        })
+
+    # Pass 1: collect dataset/domain labels only from likely dataset records or source href.
+    for payload in payloads:
+        source_href = safe_text(payload.get("__source_href", "")) if isinstance(payload, dict) else ""
+        source_dom = _infer_domain_from_href(source_href)
+        for d in iter_json_dicts(payload):
+            if not isinstance(d, dict):
+                continue
+            d_source = safe_text(d.get("__source_href", "")) or source_href
+            href_dom = _infer_domain_from_href(d_source)
+            raw_dom = json_first_value(d, ["domain", "dataset", "datasetName", "shortName", "submissionValue"], "")
+            if isinstance(raw_dom, dict):
+                raw_dom = json_first_value(raw_dom, ["name", "submissionValue", "label"], "")
+            dom = safe_text(raw_dom).upper() or href_dom or source_dom
+            label = json_first_value(d, ["label", "description", "title", "datasetLabel", "preferredTerm", "definition"], "")
+            if _looks_like_dataset_record(d):
+                add_domain(dom, label)
+            elif href_dom and any(str(k).lower() in {"label", "description", "title", "datasetlabel"} for k in d.keys()):
+                # Dataset-specific payload root may be sparse but the href tells us the domain.
+                add_domain(href_dom, label)
+
+    # Pass 2: collect variable records and attach to parent domain from explicit dataset/domain or href.
+    for payload in payloads:
+        source_href = safe_text(payload.get("__source_href", "")) if isinstance(payload, dict) else ""
+        source_dom = _infer_domain_from_href(source_href)
+        for d in iter_json_dicts(payload):
+            if not isinstance(d, dict):
+                continue
+            keys = {str(k).lower() for k in d.keys()}
+            if not (keys & {"variable", "variablename", "core", "role", "datatype", "type", "length", "origin"}):
+                continue
+
+            var = json_first_value(d, ["variable", "variableName", "name", "submissionValue"], "")
+            if isinstance(var, dict):
+                var = json_first_value(var, ["name", "submissionValue", "label"], "")
+            var = safe_text(var).upper()
+
+            explicit_dom = json_first_value(d, ["domain", "dataset", "datasetName", "parentDomain"], "")
+            if isinstance(explicit_dom, dict):
+                explicit_dom = json_first_value(explicit_dom, ["name", "submissionValue", "label"], "")
+            explicit_dom = safe_text(explicit_dom).upper()
+            d_href = safe_text(d.get("__source_href", "")) or source_href
+            href_dom = _infer_domain_from_href(d_href)
+            vdom = explicit_dom if _is_actual_sdtm_domain_code(explicit_dom) else (href_dom or source_dom)
+
+            # Do not guess AGE -> AGE or ACTARM -> ACTARM. If no parent domain is known, skip.
+            if not _is_actual_sdtm_domain_code(vdom):
+                continue
+
+            vlabel = json_first_value(d, ["label", "variableLabel", "description", "title", "definition"], "")
+            role = json_first_value(d, ["role", "varRole"], "")
+            core = json_first_value(d, ["core", "requirement", "mandatory"], "")
+            add_domain(vdom, domain_labels.get(vdom, vdom))
+            add_variable(vdom, var, vlabel, role, core)
+
+    for dom in list(variables_by_domain.keys()):
+        variables_by_domain[dom] = sorted(variables_by_domain[dom], key=lambda x: x["variable"])
+    domain_labels = {dom: domain_labels.get(dom, dom) for dom in sorted(variables_by_domain.keys())}
+    return domain_labels, variables_by_domain
+
+
+def _tag_payload_source(payload, href):
+    """Attach source href to a payload recursively enough for parser context."""
+    if isinstance(payload, dict):
+        payload.setdefault("__source_href", href)
+        for v in payload.values():
+            if isinstance(v, dict):
+                v.setdefault("__source_href", href)
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, dict):
+                        item.setdefault("__source_href", href)
+    return payload
+
+
+def load_sdtmig_metadata_from_cdisc(standard_text):
+    primary, secondary, key_file = load_cdisc_api_keys_for_sdtm()
+    version_match = re.search(r"(\d+)\.(\d+)", safe_text(standard_text))
+    if version_match:
+        version = f"{version_match.group(1)}-{version_match.group(2)}"
+    else:
+        version = "3-4"
+
+    endpoints = [
+        f"/mdr/sdtmig/{version}",
+        f"/mdr/sdtmig/{version}/datasets",
+        f"/mdr/sdtmig/{version}/domains",
+    ]
+    payloads = []
+    errors = []
+    for endpoint in endpoints:
+        try:
+            payloads.append(_tag_payload_source(cdisc_api_get(endpoint, primary, secondary), endpoint))
+        except Exception as e:
+            errors.append(f"{endpoint}: {e}")
+
+    # Follow dataset/domain links and then variable links.
+    followed = set()
+    for payload in list(payloads):
+        for link in extract_api_links(payload):
+            href = link.get("href", "")
+            hlow = href.lower()
+            if not href or href in followed:
+                continue
+            if any(token in hlow for token in ["/datasets/", "/domains/", "/variables", "variables"]):
+                followed.add(href)
+                try:
+                    sub = _tag_payload_source(cdisc_api_get(href, primary, secondary), href)
+                    payloads.append(sub)
+                    for sub_link in extract_api_links(sub):
+                        shref = sub_link.get("href", "")
+                        if shref and shref not in followed and "variable" in shref.lower():
+                            followed.add(shref)
+                            try:
+                                payloads.append(_tag_payload_source(cdisc_api_get(shref, primary, secondary), shref))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+    domain_labels, variables_by_domain = parse_sdtm_domain_and_variable_metadata(payloads)
+
+    if not variables_by_domain:
+        raise RuntimeError(
+            "Unable to parse SDTM domain/variable metadata from CDISC Library.\n\n"
+            "Tried:\n" + "\n".join(endpoints) +
+            ("\n\nEndpoint errors:\n" + "\n".join(errors) if errors else "")
+        )
+
+    return {
+        "key_file": key_file,
+        "standard": standard_text,
+        "domain_labels": domain_labels,
+        "variables_by_domain": variables_by_domain,
+    }
 
 # ================================
 # Helpers
@@ -271,29 +644,31 @@ def rect_from_top_origin(x1: float, y1_top: float, width: float, height: float, 
 
 
 def get_page_domain_color_map(entries, pageno: int) -> dict:
-    ordered_domains = OrderedDict()
+    """Return stable domain colours for the current page.
+
+    Earlier GUI preview colour was based on the order in which domains appeared on
+    each page. That made the same domain appear in different colours in the GUI,
+    although final rendering could look correct. This function now uses a stable
+    domain-to-colour mapping so AE, DM, CM, etc. remain consistent.
+    """
+    color_map = {}
     for e in entries:
         if e.pageno != pageno:
             continue
         dom = (e.domain or "").strip().upper()
         if not dom or dom == "NOTSUB":
             continue
-        if dom not in ordered_domains:
-            ordered_domains[dom] = None
-
-    color_map = {}
-    for i, dom in enumerate(ordered_domains.keys()):
-        if i < len(DOMAIN_COLORS):
-            color_map[dom] = DOMAIN_COLORS[i]
-        else:
-            color_map[dom] = DEFAULT_OTHER_FILL
+        color_map[dom] = stable_domain_color(dom)
     return color_map
 
 
 def compute_entry_layout(entry, color_map, page_width=None):
     domain_key = (entry.domain or "").strip().upper()
 
-    fill = NOTSUB_FILL if entry.is_not_submitted else color_map.get(domain_key, DEFAULT_OTHER_FILL)
+    # Use direct stable domain colour for GUI preview and final rendering.
+    # Do not depend on per-page colour-map order, otherwise the same domain can
+    # appear in different colours while reviewing.
+    fill = NOTSUB_FILL if entry.is_not_submitted else stable_domain_color(domain_key)
     dashed = bool(entry.is_assigned_field)
     bold = bool(entry.is_domain_annotation)
     font_size = DOMAIN_FONT_SIZE if bold else BASE_FONT_SIZE
@@ -911,21 +1286,26 @@ def atomic_csv_write(out_path: str, write_callback):
 class AnnotationDialog(QtWidgets.QDialog):
     def __init__(self, parent=None, initial_data=None, dialog_title="Annotation Details"):
         super().__init__(parent)
+        self.parent_app = parent
         self.setWindowTitle(dialog_title)
-        self.resize(700, 500)
-        self.setMinimumSize(700, 500)
+        self.resize(760, 520)
+        self.setMinimumSize(760, 520)
         self.setModal(True)
 
         self._updating_refpage_ui = False
+        self._auto_annotation = ""
+
+        self.domain_labels = getattr(parent, "sdtm_domain_labels", {}) if parent is not None else {}
+        self.variables_by_domain = getattr(parent, "sdtm_variables_by_domain", {}) if parent is not None else {}
 
         self.setStyleSheet("""
             QDialog { background-color: #f4f8ff; border-radius: 14px; }
             QLabel { font-family: 'Times New Roman'; font-size: 12pt; color: #1c2e4a; }
-            QLineEdit, QTextEdit, QSpinBox {
+            QLineEdit, QTextEdit, QSpinBox, QComboBox {
                 background: #ffffff; border: 1px solid #a8bfdc; border-radius: 8px;
                 padding: 6px 8px; font-family: 'Times New Roman'; font-size: 12pt; color: #1a1a1a;
             }
-            QLineEdit:focus, QTextEdit:focus, QSpinBox:focus { border: 2px solid #4d8ef7; background: #fdfefe; }
+            QLineEdit:focus, QTextEdit:focus, QSpinBox:focus, QComboBox:focus { border: 2px solid #4d8ef7; background: #fdfefe; }
             QCheckBox { font-family: 'Times New Roman'; font-size: 12pt; color: #143b66; spacing: 8px; }
             QCheckBox::indicator { width: 18px; height: 18px; }
             QDialogButtonBox QPushButton {
@@ -934,12 +1314,20 @@ class AnnotationDialog(QtWidgets.QDialog):
             }
         """)
 
-        self.domain_edit = QtWidgets.QLineEdit()
-        self.name_edit = QtWidgets.QLineEdit()
+        self.domain_combo = QtWidgets.QComboBox()
+        self.domain_combo.setEditable(True)
+        self.domain_combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.domain_combo.setMinimumWidth(420)
+
+        self.name_combo = QtWidgets.QComboBox()
+        self.name_combo.setEditable(True)
+        self.name_combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.name_combo.setMinimumWidth(420)
+
         self.annotation_edit = QtWidgets.QTextEdit()
         self.annotation_edit.setMinimumHeight(140)
 
-        self.chk_domain = QtWidgets.QCheckBox("Domain")
+        self.chk_domain = QtWidgets.QCheckBox("Domain annotation")
         self.chk_assigned = QtWidgets.QCheckBox("Assigned field")
         self.chk_notsub = QtWidgets.QCheckBox("Not Submitted")
         self.chk_refpage = QtWidgets.QCheckBox("Refer Page")
@@ -950,6 +1338,12 @@ class AnnotationDialog(QtWidgets.QDialog):
         self.ref_page_spin.setValue(1)
         self.ref_page_spin.setFixedWidth(110)
 
+        self.populate_domain_combo()
+
+        self.domain_combo.currentIndexChanged.connect(self.on_domain_changed)
+        self.domain_combo.lineEdit().editingFinished.connect(self.on_domain_changed)
+        self.name_combo.currentIndexChanged.connect(self.on_variable_changed)
+        self.name_combo.lineEdit().editingFinished.connect(self.on_variable_changed)
         self.chk_domain.stateChanged.connect(self.toggle_dialog_state)
         self.chk_assigned.stateChanged.connect(self.toggle_dialog_state)
         self.chk_notsub.stateChanged.connect(self.toggle_dialog_state)
@@ -973,8 +1367,8 @@ class AnnotationDialog(QtWidgets.QDialog):
         form.setLabelAlignment(QtCore.Qt.AlignRight)
         form.setHorizontalSpacing(18)
         form.setVerticalSpacing(14)
-        form.addRow(self.lbl_domain, self.domain_edit)
-        form.addRow(self.lbl_name, self.name_edit)
+        form.addRow(self.lbl_domain, self.domain_combo)
+        form.addRow(self.lbl_name, self.name_combo)
         form.addRow(self.lbl_annotation, self.annotation_edit)
 
         anno_type_hdr = QtWidgets.QLabel("Annotation type")
@@ -997,7 +1391,11 @@ class AnnotationDialog(QtWidgets.QDialog):
         ref_row.addWidget(self.ref_page_spin)
         ref_row.addStretch()
 
-        note = QtWidgets.QLabel("If none is selected, it is treated as a variable annotation for a collected field. Use Refer Page to create a standard page-reference annotation.")
+        std_text = getattr(parent, "sdtm_standard_text", "SDTMIG metadata not loaded") if parent is not None else "SDTMIG metadata not loaded"
+        note = QtWidgets.QLabel(
+            f"SDTM metadata source: {std_text}. Select Domain and Variable from CDISC Library metadata. "
+            "For domain annotation, annotation text is populated automatically as DOMAIN (Dataset Label)."
+        )
         note.setWordWrap(True)
         note.setStyleSheet("QLabel { color: #556b84; font-size: 11pt; font-style: italic; }")
 
@@ -1026,6 +1424,110 @@ class AnnotationDialog(QtWidgets.QDialog):
 
         if initial_data:
             self.load_initial_data(initial_data)
+        else:
+            self.on_domain_changed()
+
+    def selected_domain(self):
+        data = self.domain_combo.currentData()
+        if data:
+            return safe_text(data).upper()
+        txt = safe_text(self.domain_combo.currentText())
+        return txt.split("-")[0].split()[0].strip().upper() if txt else ""
+
+    def selected_variable(self):
+        data = self.name_combo.currentData()
+        if data:
+            return safe_text(data).upper()
+        txt = safe_text(self.name_combo.currentText())
+        return txt.split("-")[0].split()[0].strip().upper() if txt else ""
+
+    def domain_label(self, domain=None):
+        dom = domain or self.selected_domain()
+        return safe_text(self.domain_labels.get(dom, ""))
+
+    def variable_label(self, domain=None, variable=None):
+        dom = domain or self.selected_domain()
+        var = variable or self.selected_variable()
+        for item in self.variables_by_domain.get(dom, []):
+            if safe_text(item.get("variable")).upper() == var:
+                return safe_text(item.get("label"))
+        return ""
+
+    def populate_domain_combo(self):
+        self.domain_combo.blockSignals(True)
+        self.domain_combo.clear()
+        # Show only the domain code in the dropdown. Label is still retained internally
+        # for auto-generated domain annotations like DM (Demographics).
+        for dom in sorted(self.domain_labels.keys()):
+            self.domain_combo.addItem(dom, dom)
+        self.domain_combo.blockSignals(False)
+        self.populate_variable_combo()
+
+    def populate_variable_combo(self):
+        dom = self.selected_domain()
+        current = self.selected_variable()
+        self.name_combo.blockSignals(True)
+        self.name_combo.clear()
+        # Show only the variable name in the dropdown. Label is retained internally
+        # and manual entry is still allowed because the combo is editable.
+        for item in self.variables_by_domain.get(dom, []):
+            var = safe_text(item.get("variable")).upper()
+            if var:
+                self.name_combo.addItem(var, var)
+        if current:
+            idx = self.name_combo.findData(current)
+            if idx >= 0:
+                self.name_combo.setCurrentIndex(idx)
+            else:
+                self.name_combo.setEditText(current)
+        self.name_combo.blockSignals(False)
+
+    def set_domain_value(self, domain):
+        domain = safe_text(domain).upper()
+        idx = self.domain_combo.findData(domain)
+        if idx >= 0:
+            self.domain_combo.setCurrentIndex(idx)
+        elif domain:
+            self.domain_combo.setEditText(domain)
+        self.populate_variable_combo()
+
+    def set_variable_value(self, variable):
+        variable = safe_text(variable).upper()
+        idx = self.name_combo.findData(variable)
+        if idx >= 0:
+            self.name_combo.setCurrentIndex(idx)
+        elif variable:
+            self.name_combo.setEditText(variable)
+
+    def set_auto_annotation(self, text):
+        text = safe_text(text)
+        current = self.annotation_edit.toPlainText().replace("\t", "    ").rstrip()
+        if not current or current == self._auto_annotation:
+            self.annotation_edit.setPlainText(text)
+        self._auto_annotation = text
+
+    def build_domain_annotation_text(self):
+        dom = self.selected_domain()
+        label = self.domain_label(dom)
+        return f"{dom} ({label})" if dom and label and label != dom else dom
+
+    def build_variable_annotation_text(self):
+        # Variable annotation text should show only the SDTM variable name.
+        # Domain is stored separately in the CSV/entry metadata and is used for colouring.
+        var = self.selected_variable()
+        dom = self.selected_domain()
+        return var or dom
+
+    def on_domain_changed(self):
+        self.populate_variable_combo()
+        if self.chk_domain.isChecked():
+            self.set_auto_annotation(self.build_domain_annotation_text())
+        elif not self.chk_notsub.isChecked() and not self.chk_refpage.isChecked():
+            self.set_auto_annotation(self.build_variable_annotation_text())
+
+    def on_variable_changed(self):
+        if not self.chk_domain.isChecked() and not self.chk_notsub.isChecked() and not self.chk_refpage.isChecked():
+            self.set_auto_annotation(self.build_variable_annotation_text())
 
     def load_initial_data(self, data):
         domain = (data.get("domain") or "").strip()
@@ -1045,18 +1547,19 @@ class AnnotationDialog(QtWidgets.QDialog):
             self.toggle_dialog_state()
             return
 
+        self.set_domain_value(domain)
+        self.set_variable_value(name)
         self.chk_domain.setChecked(is_domain_annotation)
         self.chk_assigned.setChecked(is_assigned_field)
         self.chk_notsub.setChecked(is_not_submitted)
-        self.domain_edit.setText(domain)
-        self.name_edit.setText(name)
         self.annotation_edit.setPlainText(annotation)
+        self._auto_annotation = annotation
         self.toggle_dialog_state()
 
     def _set_ref_annotation_text(self):
         ref_page = int(self.ref_page_spin.value())
-        self.domain_edit.setText("REF")
-        self.name_edit.setText("REF")
+        self.domain_combo.setEditText("REF")
+        self.name_combo.setEditText("REF")
         self.annotation_edit.setPlainText(f"For annotation details, refer to page {ref_page}.")
 
     def on_ref_page_changed(self):
@@ -1084,18 +1587,14 @@ class AnnotationDialog(QtWidgets.QDialog):
                 self.chk_domain.setChecked(False)
                 self.chk_assigned.setChecked(False)
                 self.chk_notsub.setChecked(False)
-
                 self.chk_domain.setDisabled(True)
                 self.chk_assigned.setDisabled(True)
                 self.chk_notsub.setDisabled(True)
-
-                self.domain_edit.setDisabled(True)
-                self.name_edit.setDisabled(True)
+                self.domain_combo.setDisabled(True)
+                self.name_combo.setDisabled(True)
                 self.annotation_edit.setDisabled(True)
-
                 self.lbl_name.setVisible(True)
-                self.name_edit.setVisible(True)
-
+                self.name_combo.setVisible(True)
                 self._set_ref_annotation_text()
             finally:
                 self._updating_refpage_ui = False
@@ -1104,48 +1603,34 @@ class AnnotationDialog(QtWidgets.QDialog):
         self.chk_domain.setDisabled(False)
         self.chk_assigned.setDisabled(False)
         self.chk_notsub.setDisabled(False)
-
-        self.domain_edit.setDisabled(False)
-        self.name_edit.setDisabled(False)
+        self.domain_combo.setDisabled(False)
+        self.name_combo.setDisabled(False)
         self.annotation_edit.setDisabled(False)
 
-        if self.domain_edit.text().strip().upper() == "REF":
-            self.domain_edit.clear()
-        if self.name_edit.text().strip().upper() == "REF":
-            self.name_edit.clear()
-        if self.annotation_edit.toPlainText().replace("\t", "    ").rstrip().upper().startswith("FOR ANNOTATION DETAILS, REFER TO PAGE"):
-            self.annotation_edit.clear()
-
-        self.lbl_name.setVisible(not is_domain)
-        self.name_edit.setVisible(not is_domain)
-        if is_domain:
-            self.name_edit.clear()
-
         if is_notsub:
-            self.domain_edit.setText("NOTSUB")
-            self.name_edit.setText("NOTSUB")
+            self.domain_combo.setEditText("NOTSUB")
+            self.name_combo.setEditText("NOTSUB")
             self.annotation_edit.setPlainText("[NOT SUBMITTED]")
-            self.domain_edit.setDisabled(True)
-            self.name_edit.setDisabled(True)
+            self.domain_combo.setDisabled(True)
+            self.name_combo.setDisabled(True)
             self.annotation_edit.setDisabled(True)
             self.chk_domain.setChecked(False)
             self.chk_domain.setDisabled(True)
             self.chk_assigned.setChecked(False)
             self.chk_assigned.setDisabled(True)
             self.lbl_name.setVisible(True)
-            self.name_edit.setVisible(True)
-        else:
-            if self.domain_edit.text().strip() == "NOTSUB":
-                self.domain_edit.clear()
-            if self.name_edit.text().strip() == "NOTSUB":
-                self.name_edit.clear()
-            if self.annotation_edit.toPlainText().replace("\t", "    ").rstrip() == "[NOT SUBMITTED]":
-                self.annotation_edit.clear()
+            self.name_combo.setVisible(True)
+            return
 
-            self.lbl_name.setVisible(not is_domain)
-            self.name_edit.setVisible(not is_domain)
-            if is_domain:
-                self.name_edit.clear()
+        self.lbl_name.setVisible(not is_domain)
+        self.name_combo.setVisible(not is_domain)
+        if is_domain:
+            self.name_combo.setEditText("")
+            self.annotation_edit.setDisabled(True)
+            self.set_auto_annotation(self.build_domain_annotation_text())
+        else:
+            self.annotation_edit.setDisabled(False)
+            self.set_auto_annotation(self.build_variable_annotation_text())
 
     def validate_and_accept(self):
         is_refpage = self.chk_refpage.isChecked()
@@ -1153,14 +1638,14 @@ class AnnotationDialog(QtWidgets.QDialog):
             self.accept()
             return
 
-        if not self.domain_edit.text().strip():
+        if not self.selected_domain():
             QtWidgets.QMessageBox.warning(self, "Validation", "DOMAIN is required.")
             return
         if not self.annotation_edit.toPlainText().replace("\t", "    ").rstrip():
             QtWidgets.QMessageBox.warning(self, "Validation", "ANNOTATION is required.")
             return
         if not self.chk_domain.isChecked() and not self.chk_notsub.isChecked():
-            if not self.name_edit.text().strip():
+            if not self.selected_variable():
                 QtWidgets.QMessageBox.warning(self, "Validation", "VARIABLE is required.")
                 return
         self.accept()
@@ -1194,10 +1679,13 @@ class AnnotationDialog(QtWidgets.QDialog):
                 "is_not_submitted": True
             }
 
+        domain = self.selected_domain()
+        variable = "" if is_domain_annotation else self.selected_variable()
+        annotation = self.build_domain_annotation_text() if is_domain_annotation else self.annotation_edit.toPlainText().replace("\t", "    ").rstrip()
         return {
-            "domain": self.domain_edit.text().strip(),
-            "name": "" if is_domain_annotation else self.name_edit.text().strip(),
-            "annotation": self.annotation_edit.toPlainText().replace("\t", "    ").rstrip(),
+            "domain": domain,
+            "name": variable,
+            "annotation": annotation,
             "assignedfield": "Y" if is_assigned_field else "",
             "is_domain_annotation": is_domain_annotation,
             "is_assigned_field": is_assigned_field,
@@ -1596,7 +2084,10 @@ class PdfLabel(QtWidgets.QLabel):
                     painter.drawEllipse(p1, 5, 5)
                     painter.drawEllipse(p2, 5, 5)
 
-            fill_q = qcolor_from_rgb01(layout["fill"])
+            # GUI preview colour must match final PDF colour by domain.
+            # Use entry.domain directly here instead of any selected/default widget colour.
+            preview_fill = NOTSUB_FILL if entry.is_not_submitted else stable_domain_color(entry.domain)
+            fill_q = qcolor_from_rgb01(preview_fill)
             fill_q.setAlpha(210)
             painter.fillRect(rect, fill_q)
 
@@ -1721,6 +2212,11 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.line_capture_stage = None
         self.pending_line_start = None
 
+        self.sdtm_standard_text = "SDTMIG 3.4"
+        self.sdtm_domain_labels = {}
+        self.sdtm_variables_by_domain = {}
+        self.sdtm_metadata_loaded = False
+
         self.build_ui()
 
     def apply_app_icon(self):
@@ -1796,13 +2292,90 @@ class AnnotatorApp(QtWidgets.QWidget):
             b.setMinimumWidth(max(170, b.fontMetrics().horizontalAdvance(text) + 42))
             return b
 
-        # Top controls
+        # Single compact toolbar: SDTM metadata + PDF navigation
         top_row = QtWidgets.QHBoxLayout()
-        top_row.setSpacing(8)
+        top_row.setSpacing(10)
+
+        cdisc_label = QtWidgets.QLabel("SDTM Standard:")
+        cdisc_label.setStyleSheet("""
+            QLabel {
+                font-family: 'Times New Roman';
+                font-size: 11pt;
+                font-weight: bold;
+                color: #1e3a8a;
+                padding-right: 2px;
+            }
+        """)
+        cdisc_label.setMinimumWidth(125)
+        cdisc_label.setMaximumWidth(140)
+        cdisc_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+
+        self.sdtmig_combo = QtWidgets.QComboBox()
+        self.sdtmig_combo.addItems(SDTMIG_STANDARD_OPTIONS)
+        self.sdtmig_combo.setCurrentText(self.sdtm_standard_text)
+        self.sdtmig_combo.setMinimumWidth(165)
+        self.sdtmig_combo.setMaximumWidth(185)
+        self.sdtmig_combo.setMinimumHeight(42)
+        self.sdtmig_combo.setStyleSheet("""
+            QComboBox {
+                background-color: #ffffff;
+                color: #12395f;
+                border: 1px solid #b8cfe4;
+                border-radius: 10px;
+                padding: 6px 34px 6px 12px;
+                font-family: 'Times New Roman';
+                font-size: 11pt;
+                font-weight: bold;
+            }
+            QComboBox:hover {
+                border: 1px solid #5f9ed1;
+                background-color: #f8fbff;
+            }
+            QComboBox::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 28px;
+                border-left: 1px solid #d4e2ef;
+                border-top-right-radius: 10px;
+                border-bottom-right-radius: 10px;
+                background-color: #eef6ff;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                width: 0px;
+                height: 0px;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 7px solid #12395f;
+                margin-right: 8px;
+            }
+            QAbstractItemView {
+                background-color: #ffffff;
+                color: #12395f;
+                selection-background-color: #d9ecff;
+                selection-color: #12395f;
+                border: 1px solid #b8cfe4;
+                font-family: 'Times New Roman';
+                font-size: 11pt;
+                padding: 4px;
+            }
+        """)
+
+        self.btn_load_sdtm = mkbtn("Load Metadata", "#0f766e", "#159287")
+        self.btn_load_sdtm.setMinimumWidth(150)
+        self.btn_load_sdtm.setMaximumWidth(170)
 
         self.btn_open = mkbtn("Open PDF", "#3b82f6", "#5c9cff")
+        self.btn_open.setMinimumWidth(120)
+        self.btn_open.setMaximumWidth(145)
+
         self.btn_prev = mkbtn("Previous Page", "#9ca3af", "#b6bcc7", "#1f2937")
+        self.btn_prev.setMinimumWidth(135)
+        self.btn_prev.setMaximumWidth(155)
+
         self.btn_next = mkbtn("Next Page", "#6b7280", "#7b8495")
+        self.btn_next.setMinimumWidth(115)
+        self.btn_next.setMaximumWidth(135)
 
         self.btn_prev.setEnabled(False)
         self.btn_next.setEnabled(False)
@@ -1813,7 +2386,7 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.page_jump_spin.setEnabled(False)
         self.page_jump_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
         self.page_jump_spin.setAlignment(QtCore.Qt.AlignCenter)
-        self.page_jump_spin.setFixedWidth(90)
+        self.page_jump_spin.setFixedWidth(78)
         self.page_jump_spin.setStyleSheet("""
             QSpinBox {
                 background: #ffffff; color: #12608d; border: 1px solid #b8cfe4; border-radius: 8px;
@@ -1822,27 +2395,35 @@ class AnnotatorApp(QtWidgets.QWidget):
         """)
 
         self.btn_go_page = mkbtn("Go", "#0284c7", "#0ea5e9")
-        self.btn_go_page.setMinimumWidth(80)
+        self.btn_go_page.setMinimumWidth(70)
+        self.btn_go_page.setMaximumWidth(80)
         self.btn_go_page.setEnabled(False)
 
         self.page_info = QtWidgets.QLabel("Page: -")
+        self.page_info.setFixedWidth(105)
+        self.page_info.setAlignment(QtCore.Qt.AlignCenter)
         self.page_info.setStyleSheet("""
             QLabel {
-                background: #e6f2fb; color: #12608d; border-radius: 8px; padding: 5px 10px;
+                background: #e6f2fb; color: #12608d; border-radius: 8px; padding: 5px 8px;
                 font-family: 'Times New Roman'; font-size: 11pt; font-weight: bold;
             }
         """)
 
         self.btn_terminate = mkbtn("Terminate", "#991b1b", "#b91c1c")
+        self.btn_terminate.setMinimumWidth(120)
+        self.btn_terminate.setMaximumWidth(145)
 
+        top_row.addWidget(cdisc_label)
+        top_row.addWidget(self.sdtmig_combo)
+        top_row.addWidget(self.btn_load_sdtm)
         top_row.addWidget(self.btn_open)
         top_row.addWidget(self.btn_prev)
         top_row.addWidget(self.btn_next)
         top_row.addWidget(self.page_jump_spin)
         top_row.addWidget(self.btn_go_page)
+        top_row.addWidget(self.page_info)
         top_row.addStretch()
         top_row.addWidget(self.btn_terminate)
-        top_row.addWidget(self.page_info)
         layout.addLayout(top_row)
 
         # Mode row
@@ -2123,6 +2704,7 @@ class AnnotatorApp(QtWidgets.QWidget):
 
         # Connections
         self.btn_open.clicked.connect(self.open_pdf)
+        self.btn_load_sdtm.clicked.connect(self.load_sdtm_metadata)
         self.btn_prev.clicked.connect(self.prev_page)
         self.btn_next.clicked.connect(self.next_page)
         self.btn_go_page.clicked.connect(self.go_to_page)
@@ -2260,12 +2842,48 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.btn_review.setEnabled(self.has_annotation or self.has_bookmark)
 
     # ------------------------------------------------------------------
+    # CDISC SDTM metadata load
+    # ------------------------------------------------------------------
+    def load_sdtm_metadata(self):
+        standard_text = self.sdtmig_combo.currentText().strip() if hasattr(self, "sdtmig_combo") else self.sdtm_standard_text
+        try:
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+            QtWidgets.QApplication.processEvents()
+            meta = load_sdtmig_metadata_from_cdisc(standard_text)
+            self.sdtm_standard_text = standard_text
+            self.sdtm_domain_labels = meta["domain_labels"]
+            self.sdtm_variables_by_domain = meta["variables_by_domain"]
+            self.sdtm_metadata_loaded = True
+            dom_count = len(self.sdtm_domain_labels)
+            var_count = sum(len(v) for v in self.sdtm_variables_by_domain.values())
+            QtWidgets.QMessageBox.information(
+                self,
+                "SDTM Metadata Loaded",
+                f"Loaded {dom_count} domains and {var_count} variables from {standard_text}.\n\n"
+                "Annotation dialog now uses SDTM domain and variable dropdowns."
+            )
+        except Exception as e:
+            self.sdtm_metadata_loaded = False
+            QtWidgets.QMessageBox.critical(self, "SDTM Metadata Load Failed", str(e))
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+    # ------------------------------------------------------------------
     # PDF open / render
     # ------------------------------------------------------------------
     def open_pdf(self):
-        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF Files (*.pdf)")
+        # Use the same native QFileDialog behaviour as the final Save PDF dialog.
+        # This avoids the slow/non-opening non-native dialog seen on some Windows/network setups.
+        start_dir = getattr(self, "last_pdf_dir", "") or (os.path.dirname(self.open_pdf_path) if self.open_pdf_path else SCRIPT_DIR)
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Open PDF",
+            start_dir,
+            "PDF Files (*.pdf)"
+        )
         if not file_path:
             return
+        self.last_pdf_dir = os.path.dirname(file_path)
         try:
             self.doc = fitz.open(file_path)
             self.open_pdf_path = file_path
