@@ -42,16 +42,14 @@
 #                  • CDISC Library API
 #
 # Developed By   : Manivannan Mathialagan
-# Last Updated   : July 2026
+# Last Updated   : August 2026
 #
 # ====================================================================================================
 
 import csv
 import json
-import importlib
 import os
 import re
-import subprocess
 import sys
 import tempfile
 from collections import OrderedDict
@@ -96,53 +94,6 @@ def safe_log(message: str):
 
 _ensure_console_safe_streams()
 
-# ================================
-# Auto-install required packages
-# Works on Windows and macOS
-# ================================
-REQUIRED_PACKAGES = [
-    ("PyMuPDF", "fitz"),
-    ("PyQt5", "PyQt5"),
-    ("requests", "requests"),
-]
-
-def is_packaged_exe():
-    return getattr(sys, "frozen", False)
-
-def install_if_missing(package_name, import_name=None):
-    module_name = import_name or package_name
-
-    try:
-        importlib.import_module(module_name)
-        return
-    except ImportError:
-        pass
-
-    # Never attempt pip install inside a packaged EXE
-    if is_packaged_exe():
-        raise ImportError(
-            f"Required package '{package_name}' is missing from the packaged application. "
-            f"Please install it before rebuilding the EXE."
-        )
-
-    safe_log(f"[Installing] {package_name} ...")
-
-    subprocess.check_call([
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        package_name
-    ])
-
-    importlib.invalidate_caches()
-    importlib.import_module(module_name)
-
-    safe_log(f"[Done] {package_name} installed.")
-
-for package_name, import_name in REQUIRED_PACKAGES:
-    install_if_missing(package_name, import_name)
-
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
@@ -152,13 +103,16 @@ import fitz
 import requests
 
 # ================================
-# Settings
+# Application paths and settings
 # ================================
+# Python source files are stored in <project>/scripts.
+# Shared resources and local configuration are stored in the project root.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 
 APP_ICON_CANDIDATES = [
-    os.path.join(SCRIPT_DIR, "annotator_icon.ico"),
-    os.path.join(SCRIPT_DIR, "annotator_icon.png"),
+    os.path.join(PROJECT_DIR, "annotator_icon.ico"),
+    os.path.join(PROJECT_DIR, "annotator_icon.png"),
 ]
 
 DEFAULT_ZOOM = 1.30
@@ -249,8 +203,8 @@ CHAR_WIDTHS = {
 # ================================
 CDISC_API_BASE = "https://library.cdisc.org/api"
 CDISC_KEY_FILE_CANDIDATES = [
-    os.path.join(SCRIPT_DIR, "CDISC_API_KEY.json"),
-    os.path.join(SCRIPT_DIR, "cdisc_api_key.json"),
+    os.path.join(PROJECT_DIR, "CDISC_API_KEY.json"),
+    os.path.join(PROJECT_DIR, "cdisc_api_key.json"),
 ]
 SDTMIG_STANDARD_OPTIONS = ["SDTMIG 3.4", "SDTMIG 3.3", "SDTMIG 3.2"]
 
@@ -262,7 +216,7 @@ def safe_text(value):
 
 
 def load_cdisc_api_keys_for_sdtm():
-    """Load primary/secondary CDISC Library keys from JSON in the script folder.
+    """Load primary/secondary CDISC Library keys from JSON in the project folder.
 
     Supported formats:
       {"cdisc_library": {"primary_key": "...", "secondary_key": "..."}}
@@ -284,7 +238,7 @@ def load_cdisc_api_keys_for_sdtm():
         except Exception as e:
             last_error = f"Unable to read {key_file}: {e}"
     raise FileNotFoundError(
-        "CDISC API key file was not found or is invalid. Expected CDISC_API_KEY.json in the same folder as this script."
+        "CDISC API key file was not found or is invalid. Expected CDISC_API_KEY.json in the AnnotateCRF Studio project folder."
         + (f"\n{last_error}" if last_error else "")
     )
 
@@ -3100,7 +3054,7 @@ class AnnotatorApp(QtWidgets.QWidget):
     def open_pdf(self):
         # Use the same native QFileDialog behaviour as the final Save PDF dialog.
         # This avoids the slow/non-opening non-native dialog seen on some Windows/network setups.
-        start_dir = getattr(self, "last_pdf_dir", "") or (os.path.dirname(self.open_pdf_path) if self.open_pdf_path else SCRIPT_DIR)
+        start_dir = getattr(self, "last_pdf_dir", "") or (os.path.dirname(self.open_pdf_path) if self.open_pdf_path else PROJECT_DIR)
         file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Open PDF",
@@ -4045,7 +3999,7 @@ class AnnotatorApp(QtWidgets.QWidget):
 
         if out_path is None:
             default_path = os.path.join(
-                os.path.dirname(self.open_pdf_path) if self.open_pdf_path else SCRIPT_DIR,
+                os.path.dirname(self.open_pdf_path) if self.open_pdf_path else PROJECT_DIR,
                 "annotation_entries.csv"
             )
             out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -4362,7 +4316,7 @@ class AnnotatorApp(QtWidgets.QWidget):
 
         if out_path is None:
             default_path = os.path.join(
-                os.path.dirname(self.open_pdf_path) if self.open_pdf_path else SCRIPT_DIR,
+                os.path.dirname(self.open_pdf_path) if self.open_pdf_path else PROJECT_DIR,
                 "bookmark_entries.csv"
             )
             out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -4491,7 +4445,7 @@ class AnnotatorApp(QtWidgets.QWidget):
 
         if out_path is None:
             default_path = os.path.join(
-                os.path.dirname(self.open_pdf_path) if self.open_pdf_path else SCRIPT_DIR,
+                os.path.dirname(self.open_pdf_path) if self.open_pdf_path else PROJECT_DIR,
                 "variables.csv"
             )
             out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
