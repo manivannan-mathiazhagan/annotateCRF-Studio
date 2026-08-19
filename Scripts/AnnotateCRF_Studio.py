@@ -20,21 +20,17 @@
 #                  • Bookmark creation, editing, copying, and hierarchy management
 #                  • Automatic Table of Contents generation
 #                  • Clickable PDF bookmarks and internal navigation
-#                  • Annotation and bookmark CSV import/export
+#                  • Single-workbook Excel export for annotations, bookmarks, connector lines, and variables
 #                  • Review mode with annotation and bookmark management
 #                  • Final publication-ready annotated PDF generation
 #
 # Input Files    :
 #                  • Source CRF PDF
-#                  • Annotation CSV (optional)
-#                  • Bookmark CSV (optional)
 #                  • CDISC API Key JSON (optional for metadata integration)
 #
 # Output Files   :
 #                  • Final Annotated PDF
-#                  • Annotation CSV
-#                  • Bookmark CSV
-#                  • Connector Line CSV
+#                  • Excel workbook containing Annotations, Bookmarks, Connector Lines, and Variables
 #
 # Standards      :
 #                  • CDISC MSG 2.0
@@ -46,7 +42,6 @@
 #
 # ====================================================================================================
 
-import csv
 import json
 import os
 import re
@@ -63,7 +58,7 @@ from typing import List, Optional
 # provide a valid console. Any package or print/log call that tries to write to the
 # console can raise errors such as:
 #   Cannot open console input buffer for writing
-# These wrappers keep GUI actions such as CSV export independent of console availability.
+# These wrappers keep GUI actions such as Excel export independent of console availability.
 class _NullWriter:
     def write(self, *_args, **_kwargs):
         return 0
@@ -101,6 +96,9 @@ QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
 
 import fitz
 import requests
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 # ================================
 # Application paths and settings
@@ -175,8 +173,10 @@ LONG_TEXT_MIN_WIDTH = 220.0
 BOOKMARK_PREVIEW_COLOR = QtGui.QColor("#7c3aed")
 BOOKMARK_PREVIEW_TEXT_COLOR = QtGui.QColor("#5b21b6")
 
-ANNOTATION_CSV_COLUMNS = ["TYPE", "DOMAIN", "NAME", "PAGENO", "ANNOTATION", "ASSIGNEDFIELD", "X1", "Y1", "PAGEH", "BOX_W", "BOX_H", "LINE_PAGENO", "LINE_X1", "LINE_Y1", "LINE_X2", "LINE_Y2"]
-BOOKMARK_CSV_COLUMNS = ["TITLE", "LEVEL", "PAGENO"]
+ANNOTATION_EXCEL_COLUMNS = ["DOMAIN", "NAME", "PAGENO", "ANNOTATION", "ASSIGNEDFIELD", "X1", "Y1", "PAGEH", "BOX_W", "BOX_H"]
+BOOKMARK_EXCEL_COLUMNS = ["TITLE", "LEVEL", "PAGENO"]
+CONNECTOR_LINE_EXCEL_COLUMNS = ["PAGENO", "X1", "Y1", "X2", "Y2"]
+VARIABLE_EXCEL_COLUMNS = ["DOMAIN", "VARIABLE", "PAGES"]
 
 CHAR_WIDTHS = {
     '!': 3.43, '"': 4.82, '#': 5.65, '$': 5.65, '%': 8.99, "'": 2.47,
@@ -453,10 +453,17 @@ def parse_sdtm_domain_and_variable_metadata(payloads):
             add_domain(vdom, domain_labels.get(vdom, vdom))
             add_variable(vdom, var, vlabel, role, core)
 
-    for dom in list(variables_by_domain.keys()):
-        variables_by_domain[dom] = sorted(variables_by_domain[dom], key=lambda x: x["variable"])
-    domain_labels = {dom: domain_labels.get(dom, dom) for dom in sorted(variables_by_domain.keys())}
-    return domain_labels, variables_by_domain
+    # Preserve the domain and variable order supplied by the CDISC Library metadata.
+    # Do not alphabetically sort variables: their source order is meaningful in the UI.
+    ordered_domain_labels = {}
+    for dom in domain_labels:
+        if dom in variables_by_domain:
+            ordered_domain_labels[dom] = domain_labels.get(dom, dom)
+    for dom in variables_by_domain:
+        if dom not in ordered_domain_labels:
+            ordered_domain_labels[dom] = domain_labels.get(dom, dom)
+
+    return ordered_domain_labels, variables_by_domain
 
 
 def _tag_payload_source(payload, href):
@@ -1346,24 +1353,25 @@ WINDOWS_RESERVED_NAMES = {
 }
 
 
-def ensure_csv_extension(path: str) -> str:
+def ensure_xlsx_extension(path: str) -> str:
     path = str(path or "").strip()
-    if path and not path.lower().endswith(".csv"):
-        path += ".csv"
+    if path and not path.lower().endswith(".xlsx"):
+        path += ".xlsx"
     return path
 
 
-def validate_windows_output_path(path: str):
+def validate_output_path(path: str):
     if not path:
         raise ValueError("Output path is blank.")
 
     base = os.path.basename(path).strip().rstrip(". ")
-    stem = os.path.splitext(base)[0].upper()
-    if stem in WINDOWS_RESERVED_NAMES:
-        raise ValueError(
-            f"'{base}' is a reserved Windows device name. Please use a normal file name, "
-            f"for example annotation_entries.csv."
-        )
+    if os.name == "nt":
+        stem = os.path.splitext(base)[0].upper()
+        if stem in WINDOWS_RESERVED_NAMES:
+            raise ValueError(
+                f"'{base}' is a reserved Windows device name. Please use a normal file name, "
+                f"for example annotatecrf_workbook.xlsx."
+            )
 
     out_dir = os.path.dirname(os.path.abspath(path)) or os.getcwd()
     if not os.path.isdir(out_dir):
@@ -1373,20 +1381,17 @@ def validate_windows_output_path(path: str):
         raise PermissionError(f"No write access to output folder:\n{out_dir}")
 
 
-def atomic_csv_write(out_path: str, write_callback):
-    """Write CSV through a temp file first, then replace final output.
-    This avoids half-created CSV files if export fails midway.
-    """
-    out_path = ensure_csv_extension(out_path)
-    validate_windows_output_path(out_path)
+def atomic_excel_write(out_path: str, workbook: Workbook):
+    """Write the workbook through a temporary file, then replace the final output."""
+    out_path = ensure_xlsx_extension(out_path)
+    validate_output_path(out_path)
 
     out_dir = os.path.dirname(os.path.abspath(out_path)) or os.getcwd()
-    fd, tmp_path = tempfile.mkstemp(prefix="._acrf_export_", suffix=".csv", dir=out_dir)
+    fd, tmp_path = tempfile.mkstemp(prefix="._acrf_export_", suffix=".xlsx", dir=out_dir)
     os.close(fd)
 
     try:
-        with open(tmp_path, "w", newline="", encoding="utf-8-sig") as f:
-            write_callback(f)
+        workbook.save(tmp_path)
         os.replace(tmp_path, out_path)
     except Exception:
         try:
@@ -1583,39 +1588,42 @@ class AnnotationDialog(QtWidgets.QDialog):
     def populate_domain_combo(self):
         self.domain_combo.blockSignals(True)
         self.domain_combo.clear()
-        # Show only the domain code in the dropdown. Label is still retained internally
-        # for auto-generated domain annotations like DM (Demographics).
-        for dom in sorted(self.domain_labels.keys()):
+        # Preserve the domain order supplied by the loaded CDISC metadata.
+        for dom in self.domain_labels.keys():
             self.domain_combo.addItem(dom, dom)
         self.domain_combo.blockSignals(False)
         self.populate_variable_combo()
 
     def populate_variable_combo(self):
         dom = self.selected_domain()
-        current = self.selected_variable()
         self.name_combo.blockSignals(True)
         self.name_combo.clear()
-        # Show only the variable name in the dropdown. Label is retained internally
-        # and manual entry is still allowed because the combo is editable.
+
+        # Refresh immediately when Domain changes. Do not carry a variable from the
+        # previously selected domain into the new domain. Preserve CDISC source order.
         for item in self.variables_by_domain.get(dom, []):
             var = safe_text(item.get("variable")).upper()
             if var:
                 self.name_combo.addItem(var, var)
-        if current:
-            idx = self.name_combo.findData(current)
-            if idx >= 0:
-                self.name_combo.setCurrentIndex(idx)
-            else:
-                self.name_combo.setEditText(current)
+
+        if self.name_combo.count() > 0:
+            self.name_combo.setCurrentIndex(0)
+        else:
+            self.name_combo.setEditText("")
+
         self.name_combo.blockSignals(False)
 
     def set_domain_value(self, domain):
         domain = safe_text(domain).upper()
+        self.domain_combo.blockSignals(True)
         idx = self.domain_combo.findData(domain)
         if idx >= 0:
             self.domain_combo.setCurrentIndex(idx)
         elif domain:
             self.domain_combo.setEditText(domain)
+        else:
+            self.domain_combo.setEditText("")
+        self.domain_combo.blockSignals(False)
         self.populate_variable_combo()
 
     def set_variable_value(self, variable):
@@ -1647,7 +1655,7 @@ class AnnotationDialog(QtWidgets.QDialog):
 
     def build_variable_annotation_text(self):
         # Variable annotation text should show only the SDTM variable name.
-        # Domain is stored separately in the CSV/entry metadata and is used for colouring.
+        # Domain is stored separately in the entry metadata and is used for colouring.
         var = self.selected_variable()
         dom = self.selected_domain()
         return var or dom
@@ -2414,23 +2422,21 @@ class AnnotatorApp(QtWidgets.QWidget):
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(8)
 
-        header = QtWidgets.QLabel("AnnotateCRF Studio")
+        header = QtWidgets.QLabel(
+            "<span style=\"font-size:17pt; font-weight:bold;\">AnnotateCRF Studio</span> "
+            "<span style=\"font-size:12pt; font-weight:normal;\">"
+            "(One-Click Annotation &amp; Bookmarking for MSG 2.0–Compliant aCRFs)</span>"
+        )
+        header.setTextFormat(QtCore.Qt.RichText)
         header.setAlignment(QtCore.Qt.AlignCenter)
+        header.setWordWrap(False)
         header.setStyleSheet("""
             QLabel {
-                color: black; background: #bfe9f7; padding: 10px 0 8px 0; border-radius: 16px;
-                font-family: 'Times New Roman'; font-size: 20pt; font-weight: bold;
+                color: black; background: #bfe9f7; padding: 10px 8px; border-radius: 16px;
+                font-family: 'Times New Roman';
             }
         """)
         layout.addWidget(header)
-
-        subtitle = QtWidgets.QLabel(
-            "One-Click Annotation & Bookmarking for MSG 2.0–Compliant aCRFs"
-        )
-        subtitle.setAlignment(QtCore.Qt.AlignCenter)
-        subtitle.setWordWrap(True)
-        subtitle.setStyleSheet("QLabel { color: #21466d; padding: 0 0 4px 0; font-family: 'Times New Roman'; font-size: 12pt; }")
-        layout.addWidget(subtitle)
 
         contact_note = QtWidgets.QLabel(
             "For queries / suggestions / issues: Manivannan.Mathialagan@veristat.com"
@@ -2468,34 +2474,50 @@ class AnnotatorApp(QtWidgets.QWidget):
                 QPushButton {{ background-color: {bg}; color: {fg}; }}
                 QPushButton:hover:!disabled {{ background-color: {hov}; }}
             """)
-            b.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-            b.setMinimumWidth(max(170, b.fontMetrics().horizontalAdvance(text) + 42))
+            b.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+            b.setMinimumHeight(46)
+            b.setMinimumWidth(max(105, b.fontMetrics().horizontalAdvance(text) + 34))
             return b
 
-        # Single compact toolbar: SDTM metadata + PDF navigation
-        top_row = QtWidgets.QHBoxLayout()
-        top_row.setSpacing(10)
+        # Clean two-row toolbar: project actions on row 1, PDF navigation on row 2
+        toolbar_frame = QtWidgets.QFrame()
+        toolbar_frame.setObjectName("toolbarFrame")
+        toolbar_frame.setStyleSheet("""
+            QFrame#toolbarFrame {
+                background: #f7fbff;
+                border: 1px solid #d8e6f3;
+                border-radius: 12px;
+            }
+        """)
+        toolbar_layout = QtWidgets.QVBoxLayout(toolbar_frame)
+        toolbar_layout.setContentsMargins(10, 8, 10, 8)
+        toolbar_layout.setSpacing(8)
 
-        cdisc_label = QtWidgets.QLabel("SDTM Standard:")
+        top_row = QtWidgets.QHBoxLayout()
+        top_row.setSpacing(8)
+        nav_row = QtWidgets.QHBoxLayout()
+        nav_row.setSpacing(8)
+
+        cdisc_label = QtWidgets.QLabel("SDTM")
         cdisc_label.setStyleSheet("""
             QLabel {
                 font-family: 'Times New Roman';
                 font-size: 11pt;
                 font-weight: bold;
                 color: #1e3a8a;
-                padding-right: 2px;
+                padding: 0 4px;
             }
         """)
-        cdisc_label.setMinimumWidth(125)
-        cdisc_label.setMaximumWidth(140)
-        cdisc_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        cdisc_label.setMinimumWidth(70)
+        cdisc_label.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        cdisc_label.setAlignment(QtCore.Qt.AlignCenter)
 
         self.sdtmig_combo = QtWidgets.QComboBox()
         self.sdtmig_combo.addItems(SDTMIG_STANDARD_OPTIONS)
         self.sdtmig_combo.setCurrentText(self.sdtm_standard_text)
-        self.sdtmig_combo.setMinimumWidth(165)
-        self.sdtmig_combo.setMaximumWidth(185)
-        self.sdtmig_combo.setMinimumHeight(42)
+        self.sdtmig_combo.setMinimumWidth(170)
+        self.sdtmig_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.sdtmig_combo.setMinimumHeight(46)
         self.sdtmig_combo.setStyleSheet("""
             QComboBox {
                 background-color: #ffffff;
@@ -2542,20 +2564,35 @@ class AnnotatorApp(QtWidgets.QWidget):
         """)
 
         self.btn_load_sdtm = mkbtn("Load Metadata", "#0f766e", "#159287")
-        self.btn_load_sdtm.setMinimumWidth(150)
-        self.btn_load_sdtm.setMaximumWidth(170)
+        self.btn_load_sdtm.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
         self.btn_open = mkbtn("Open PDF", "#3b82f6", "#5c9cff")
-        self.btn_open.setMinimumWidth(120)
-        self.btn_open.setMaximumWidth(145)
+        self.btn_open.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+        self.btn_import_excel = mkbtn("Import Excel", "#0f766e", "#159287")
+        self.btn_import_excel.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.btn_import_excel.setEnabled(False)
+
+        self.btn_export_excel = mkbtn("Export Excel", "#2563eb", "#4a7df2")
+        self.btn_export_excel.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.btn_export_excel.setEnabled(False)
+
+        self.btn_terminate = mkbtn("Terminate", "#991b1b", "#b91c1c")
+        self.btn_terminate.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+        # Fill the complete first toolbar row with evenly distributed controls.
+        top_row.addWidget(cdisc_label, 0)
+        top_row.addWidget(self.sdtmig_combo, 2)
+        top_row.addWidget(self.btn_load_sdtm, 2)
+        top_row.addWidget(self.btn_open, 2)
+        top_row.addWidget(self.btn_import_excel, 2)
+        top_row.addWidget(self.btn_export_excel, 2)
 
         self.btn_prev = mkbtn("Previous Page", "#9ca3af", "#b6bcc7", "#1f2937")
-        self.btn_prev.setMinimumWidth(135)
-        self.btn_prev.setMaximumWidth(155)
+        self.btn_prev.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
         self.btn_next = mkbtn("Next Page", "#6b7280", "#7b8495")
-        self.btn_next.setMinimumWidth(115)
-        self.btn_next.setMaximumWidth(135)
+        self.btn_next.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
         self.btn_prev.setEnabled(False)
         self.btn_next.setEnabled(False)
@@ -2566,7 +2603,9 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.page_jump_spin.setEnabled(False)
         self.page_jump_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
         self.page_jump_spin.setAlignment(QtCore.Qt.AlignCenter)
-        self.page_jump_spin.setFixedWidth(78)
+        self.page_jump_spin.setMinimumWidth(95)
+        self.page_jump_spin.setMinimumHeight(46)
+        self.page_jump_spin.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         self.page_jump_spin.setStyleSheet("""
             QSpinBox {
                 background: #ffffff; color: #12608d; border: 1px solid #b8cfe4; border-radius: 8px;
@@ -2575,36 +2614,32 @@ class AnnotatorApp(QtWidgets.QWidget):
         """)
 
         self.btn_go_page = mkbtn("Go", "#0284c7", "#0ea5e9")
-        self.btn_go_page.setMinimumWidth(70)
-        self.btn_go_page.setMaximumWidth(80)
+        self.btn_go_page.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         self.btn_go_page.setEnabled(False)
 
         self.page_info = QtWidgets.QLabel("Page: -")
-        self.page_info.setFixedWidth(105)
+        self.page_info.setMinimumWidth(220)
+        self.page_info.setMinimumHeight(46)
+        self.page_info.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         self.page_info.setAlignment(QtCore.Qt.AlignCenter)
         self.page_info.setStyleSheet("""
             QLabel {
-                background: #e6f2fb; color: #12608d; border-radius: 8px; padding: 5px 8px;
+                background: #e6f2fb; color: #12608d; border-radius: 8px; padding: 5px 12px;
                 font-family: 'Times New Roman'; font-size: 11pt; font-weight: bold;
             }
         """)
 
-        self.btn_terminate = mkbtn("Terminate", "#991b1b", "#b91c1c")
-        self.btn_terminate.setMinimumWidth(120)
-        self.btn_terminate.setMaximumWidth(145)
+        # Fill the complete second toolbar row; no unused white space at either side.
+        nav_row.addWidget(self.btn_prev, 2)
+        nav_row.addWidget(self.btn_next, 2)
+        nav_row.addWidget(self.page_jump_spin, 1)
+        nav_row.addWidget(self.btn_go_page, 1)
+        nav_row.addWidget(self.page_info, 3)
+        nav_row.addWidget(self.btn_terminate, 2)
 
-        top_row.addWidget(cdisc_label)
-        top_row.addWidget(self.sdtmig_combo)
-        top_row.addWidget(self.btn_load_sdtm)
-        top_row.addWidget(self.btn_open)
-        top_row.addWidget(self.btn_prev)
-        top_row.addWidget(self.btn_next)
-        top_row.addWidget(self.page_jump_spin)
-        top_row.addWidget(self.btn_go_page)
-        top_row.addWidget(self.page_info)
-        top_row.addStretch()
-        top_row.addWidget(self.btn_terminate)
-        layout.addLayout(top_row)
+        toolbar_layout.addLayout(top_row)
+        toolbar_layout.addLayout(nav_row)
+        layout.addWidget(toolbar_frame)
 
         # Mode row
         mode_row = QtWidgets.QHBoxLayout()
@@ -2618,9 +2653,9 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.btn_bookmark.setEnabled(False)
         self.btn_review.setEnabled(False)
 
-        mode_row.addWidget(self.btn_annotation)
-        mode_row.addWidget(self.btn_bookmark)
-        mode_row.addWidget(self.btn_review)
+        mode_row.addWidget(self.btn_annotation, 1)
+        mode_row.addWidget(self.btn_bookmark, 1)
+        mode_row.addWidget(self.btn_review, 1)
         layout.addLayout(mode_row)
 
         # Main stack:
@@ -2711,8 +2746,6 @@ class AnnotatorApp(QtWidgets.QWidget):
         ann_btn_grid.setHorizontalSpacing(8)
         ann_btn_grid.setVerticalSpacing(8)
 
-        self.btn_export_ann = mkbtn("Export Annotation CSV", "#2563eb", "#4a7df2")
-        self.btn_load_ann = mkbtn("Load Annotation CSV", "#7c3aed", "#9b63f0")
         self.btn_edit_ann = mkbtn("Edit Selected Annotation", "#0f766e", "#159287")
         self.btn_copy_ann = mkbtn("Copy Selected Annotation", "#0369a1", "#0ea5e9")
         self.btn_copy_ann_page = mkbtn("Copy Annotation To Page", "#0f766e", "#159287")
@@ -2721,12 +2754,12 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.btn_delete_ann = mkbtn("Delete Selected Annotation(s)", "#ef4444", "#f87171")
 
         ann_buttons = [
-            self.btn_export_ann, self.btn_load_ann, self.btn_edit_ann, self.btn_copy_ann,
-            self.btn_copy_ann_page, self.btn_line_mode, self.btn_clear_line, self.btn_delete_ann
+            self.btn_edit_ann, self.btn_copy_ann, self.btn_copy_ann_page,
+            self.btn_line_mode, self.btn_clear_line, self.btn_delete_ann
         ]
         for i, btn in enumerate(ann_buttons):
-            ann_btn_grid.addWidget(btn, i // 4, i % 4)
-        for col in range(4):
+            ann_btn_grid.addWidget(btn, i // 3, i % 3)
+        for col in range(3):
             ann_btn_grid.setColumnStretch(col, 1)
 
         ann_layout.addLayout(ann_btn_grid)
@@ -2766,18 +2799,16 @@ class AnnotatorApp(QtWidgets.QWidget):
         bm_btn_grid.setHorizontalSpacing(8)
         bm_btn_grid.setVerticalSpacing(8)
 
-        self.btn_export_bm = mkbtn("Export Bookmark CSV", "#2563eb", "#4a7df2")
-        self.btn_load_bm = mkbtn("Load Bookmark CSV", "#7c3aed", "#9b63f0")
         self.btn_edit_bm = mkbtn("Edit Selected Bookmark", "#0f766e", "#159287")
         self.btn_copy_bm = mkbtn("Copy Selected Bookmark", "#0369a1", "#0ea5e9")
         self.btn_delete_bm = mkbtn("Delete Selected Bookmark", "#ef4444", "#f87171")
 
         bm_buttons = [
-            self.btn_export_bm, self.btn_load_bm, self.btn_edit_bm, self.btn_copy_bm, self.btn_delete_bm
+            self.btn_edit_bm, self.btn_copy_bm, self.btn_delete_bm
         ]
         for i, btn in enumerate(bm_buttons):
-            bm_btn_grid.addWidget(btn, i // 4, i % 4)
-        for col in range(4):
+            bm_btn_grid.addWidget(btn, 0, i)
+        for col in range(3):
             bm_btn_grid.setColumnStretch(col, 1)
 
         bm_layout.addLayout(bm_btn_grid)
@@ -2884,6 +2915,8 @@ class AnnotatorApp(QtWidgets.QWidget):
 
         # Connections
         self.btn_open.clicked.connect(self.open_pdf)
+        self.btn_import_excel.clicked.connect(self.import_project_excel)
+        self.btn_export_excel.clicked.connect(lambda: self.export_project_excel())
         self.btn_load_sdtm.clicked.connect(self.load_sdtm_metadata)
         self.btn_prev.clicked.connect(self.prev_page)
         self.btn_next.clicked.connect(self.next_page)
@@ -2903,8 +2936,6 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.review_annotation_table.itemSelectionChanged.connect(self.on_review_annotation_selection_changed)
         self.review_bookmark_table.itemSelectionChanged.connect(self.on_review_bookmark_selection_changed)
 
-        self.btn_export_ann.clicked.connect(lambda: self.export_annotations_csv())
-        self.btn_load_ann.clicked.connect(self.load_annotations_csv)
         self.btn_edit_ann.clicked.connect(self.edit_selected_annotation)
         self.btn_copy_ann.clicked.connect(self.copy_selected_annotation)
         self.btn_copy_ann_page.clicked.connect(self.copy_annotation_to_page)
@@ -2914,8 +2945,6 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.btn_line_mode.clicked.connect(self.start_connector_line_mode)
         self.btn_clear_line.clicked.connect(self.clear_connector_lines)
 
-        self.btn_export_bm.clicked.connect(lambda: self.export_bookmarks_csv())
-        self.btn_load_bm.clicked.connect(self.load_bookmarks_csv)
         self.btn_delete_bm.clicked.connect(self.delete_selected_bookmark)
 
         self.switch_mode("annotation", force=True)
@@ -3085,6 +3114,8 @@ class AnnotatorApp(QtWidgets.QWidget):
 
             self.btn_annotation.setEnabled(True)
             self.btn_bookmark.setEnabled(True)
+            self.btn_import_excel.setEnabled(True)
+            self.btn_export_excel.setEnabled(True)
             self.btn_line_mode.setEnabled(False)
             self.btn_clear_line.setEnabled(False)
             self.page_jump_spin.setRange(1, len(self.doc))
@@ -3984,94 +4015,8 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.check_review_enable()
 
     # ------------------------------------------------------------------
-    # CSV export / import
+    # Excel export
     # ------------------------------------------------------------------
-    def export_annotations_csv(self, out_path=None, show_message=True, page_offset=0, create_blank_if_none=True):
-        # PyQt clicked(bool) can accidentally pass False into out_path when connected directly.
-        # Treat boolean values as no path so the Save As dialog opens normally.
-        if isinstance(out_path, bool):
-            out_path = None
-
-        if not self.entries and not self.lines and not create_blank_if_none:
-            if show_message:
-                QtWidgets.QMessageBox.information(self, "Export Annotation CSV", "No annotations available to export.")
-            return False
-
-        if out_path is None:
-            default_path = os.path.join(
-                os.path.dirname(self.open_pdf_path) if self.open_pdf_path else PROJECT_DIR,
-                "annotation_entries.csv"
-            )
-            out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
-                self, "Export Annotation CSV", default_path, "CSV Files (*.csv)"
-            )
-            if not out_path:
-                return False
-
-        out_path = ensure_csv_extension(out_path)
-
-        try:
-            _ensure_console_safe_streams()
-
-            def _write_annotation_csv(f):
-                writer = csv.DictWriter(f, fieldnames=ANNOTATION_CSV_COLUMNS, quoting=csv.QUOTE_ALL)
-                writer.writeheader()
-                for e in self.entries:
-                    writer.writerow({
-                        "TYPE": "ANNOTATION",
-                        "DOMAIN": e.domain,
-                        "NAME": e.name,
-                        "PAGENO": int(e.pageno) + int(page_offset),
-                        "ANNOTATION": adjust_page_refs_in_text(e.annotation, page_offset),
-                        "ASSIGNEDFIELD": e.assignedfield,
-                        "X1": e.x1,
-                        "Y1": e.y1,
-                        "PAGEH": e.pageh,
-                        "BOX_W": "" if e.box_w is None else e.box_w,
-                        "BOX_H": "" if e.box_h is None else e.box_h,
-                        "LINE_PAGENO": "",
-                        "LINE_X1": "" if e.line_x1 is None else e.line_x1,
-                        "LINE_Y1": "" if e.line_y1 is None else e.line_y1,
-                        "LINE_X2": "" if e.line_x2 is None else e.line_x2,
-                        "LINE_Y2": "" if e.line_y2 is None else e.line_y2,
-                    })
-                for ln in self.lines:
-                    writer.writerow({
-                        "TYPE": "LINE",
-                        "DOMAIN": "",
-                        "NAME": "",
-                        "PAGENO": "",
-                        "ANNOTATION": "",
-                        "ASSIGNEDFIELD": "",
-                        "X1": "",
-                        "Y1": "",
-                        "PAGEH": "",
-                        "BOX_W": "",
-                        "BOX_H": "",
-                        "LINE_PAGENO": int(ln.pageno) + int(page_offset),
-                        "LINE_X1": ln.x1,
-                        "LINE_Y1": ln.y1,
-                        "LINE_X2": ln.x2,
-                        "LINE_Y2": ln.y2,
-                    })
-
-            atomic_csv_write(out_path, _write_annotation_csv)
-
-            if show_message:
-                QtWidgets.QMessageBox.information(self, "Export Annotation CSV", f"Annotation CSV exported successfully:\n{out_path}")
-            return True
-        except Exception as e:
-            if show_message:
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "Export Annotation CSV",
-                    "Failed to export annotation CSV:\n"
-                    f"{e}\n\n"
-                    "Please check that the CSV is not already open in Excel, the folder is writable, "
-                    "and the file name is not a reserved Windows name such as CON, PRN, AUX, NUL, COM1, or LPT1."
-                )
-            return False
-
     def get_pdf_page_rect(self, pageno: int):
         if not self.doc or pageno < 1 or pageno > len(self.doc):
             return None
@@ -4081,11 +4026,7 @@ class AnnotatorApp(QtWidgets.QWidget):
             return None
 
     def get_default_annotation_position(self, pageno: int, loaded_entries=None):
-        """
-        Return a default (x1, y1, pageh) for imported annotations that do not
-        provide coordinates. Stacks boxes vertically on the page so that they
-        can be reviewed and dragged later.
-        """
+        """Return a default annotation position for future workbook import support."""
         rect = self.get_pdf_page_rect(pageno)
         if rect is None:
             pagew = 595.0
@@ -4106,312 +4047,7 @@ class AnnotatorApp(QtWidgets.QWidget):
 
         return round(default_x, 6), round(default_y, 6), round(pageh, 6)
 
-    def load_annotations_csv(self):
-        if not self.doc:
-            QtWidgets.QMessageBox.warning(self, "Load Annotation CSV", "Please open the source PDF first.")
-            return
-
-        in_path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Load Annotation CSV", "", "CSV Files (*.csv)"
-        )
-        if not in_path:
-            return
-
-        try:
-            existing_entries = list(self.entries)
-            existing_lines = list(self.lines)
-            loaded_entries = list(existing_entries)
-            loaded_lines = list(existing_lines)
-
-            entry_keys = {annotation_entry_key(e) for e in loaded_entries}
-            line_keys = {connector_line_key(l) for l in loaded_lines}
-
-            added_entry_count = 0
-            duplicate_entry_count = 0
-            added_line_count = 0
-            duplicate_line_count = 0
-            missing_position_count = 0
-
-            with open(in_path, "r", newline="", encoding="utf-8-sig") as f:
-                reader = csv.DictReader(f)
-                actual = set([c.strip().upper() for c in (reader.fieldnames or [])])
-
-                required_min = {"DOMAIN", "NAME", "ANNOTATION"}
-                missing = required_min - actual
-                if missing:
-                    raise ValueError(
-                        "Annotation CSV is missing required columns.\n"
-                        f"Minimum required: {', '.join(sorted(required_min))}\n"
-                        f"Missing: {', '.join(sorted(missing))}"
-                    )
-
-                for row in reader:
-                    row_type = (row.get("TYPE") or "ANNOTATION").strip().upper()
-
-                    if row_type == "LINE":
-                        line_pageno = int(clean_number(row.get("LINE_PAGENO"), 0) or 0)
-                        line_x1 = clean_number(row.get("LINE_X1"), None)
-                        line_y1 = clean_number(row.get("LINE_Y1"), None)
-                        line_x2 = clean_number(row.get("LINE_X2"), None)
-                        line_y2 = clean_number(row.get("LINE_Y2"), None)
-
-                        if line_pageno >= 1 and None not in (line_x1, line_y1, line_x2, line_y2):
-                            new_line = ConnectorLineEntry(
-                                pageno=line_pageno,
-                                x1=line_x1,
-                                y1=line_y1,
-                                x2=line_x2,
-                                y2=line_y2
-                            )
-                            key = connector_line_key(new_line)
-                            if key in line_keys:
-                                duplicate_line_count += 1
-                            else:
-                                loaded_lines.append(new_line)
-                                line_keys.add(key)
-                                added_line_count += 1
-                        continue
-
-                    domain = (row.get("DOMAIN") or "").strip()
-                    name = (row.get("NAME") or "").strip()
-                    annotation = (row.get("ANNOTATION") or "").replace("	", "    ").rstrip()
-                    assignedfield = (row.get("ASSIGNEDFIELD") or "").strip()
-
-                    if not domain and not name and not annotation:
-                        continue
-
-                    pageno = int(clean_number(row.get("PAGENO"), 0) or 0)
-                    if pageno < 1:
-                        pageno = self.current_page_index + 1
-                    elif self.doc and pageno > len(self.doc):
-                        pageno = len(self.doc)
-
-                    raw_x1 = clean_number(row.get("X1"), None)
-                    raw_y1 = clean_number(row.get("Y1"), None)
-                    raw_pageh = clean_number(row.get("PAGEH"), None)
-
-                    box_w = clean_number(row.get("BOX_W"), None)
-                    box_h = clean_number(row.get("BOX_H"), None)
-
-                    line_x1 = clean_number(row.get("LINE_X1"), None)
-                    line_y1 = clean_number(row.get("LINE_Y1"), None)
-                    line_x2 = clean_number(row.get("LINE_X2"), None)
-                    line_y2 = clean_number(row.get("LINE_Y2"), None)
-
-                    if raw_x1 is None or raw_y1 is None or raw_pageh is None:
-                        x1, y1, pageh = self.get_default_annotation_position(
-                            pageno, loaded_entries=loaded_entries
-                        )
-                        missing_position_count += 1
-                    else:
-                        rect = self.get_pdf_page_rect(pageno)
-                        if rect is None:
-                            pagew = 595.0
-                            pageh_actual = raw_pageh
-                        else:
-                            pagew = float(rect.width)
-                            pageh_actual = float(rect.height)
-
-                        x1 = max(0.0, min(float(raw_x1), max(0.0, pagew - 20.0)))
-                        y1 = max(0.0, min(float(raw_y1), max(0.0, pageh_actual - 20.0)))
-                        # Always use the actual current PDF page height when available.
-                        # This is critical for mixed-orientation CRFs because imported CSV
-                        # rows may carry a portrait PAGEH while the current page is landscape,
-                        # or vice versa.
-                        pageh = pageh_actual
-
-                    is_domain_annotation, is_assigned_field, is_not_submitted = bool_from_entry(
-                        domain, name, annotation, assignedfield
-                    )
-
-                    new_entry = AnnotationEntry(
-                        domain=domain,
-                        name=name,
-                        pageno=pageno,
-                        annotation=annotation,
-                        assignedfield=assignedfield,
-                        x1=round(x1, 6),
-                        y1=round(y1, 6),
-                        pageh=round(pageh, 6),
-                        is_domain_annotation=is_domain_annotation,
-                        is_assigned_field=is_assigned_field,
-                        is_not_submitted=is_not_submitted,
-                        box_w=box_w,
-                        box_h=box_h,
-                        line_x1=line_x1,
-                        line_y1=line_y1,
-                        line_x2=line_x2,
-                        line_y2=line_y2
-                    )
-
-                    entry_key = annotation_entry_key(new_entry)
-                    if entry_key in entry_keys:
-                        duplicate_entry_count += 1
-                        continue
-
-                    loaded_entries.append(new_entry)
-                    entry_keys.add(entry_key)
-                    added_entry_count += 1
-
-                    if None not in (line_x1, line_y1, line_x2, line_y2):
-                        embedded_line = ConnectorLineEntry(
-                            pageno=pageno,
-                            x1=line_x1,
-                            y1=line_y1,
-                            x2=line_x2,
-                            y2=line_y2
-                        )
-                        line_key = connector_line_key(embedded_line)
-                        if line_key in line_keys:
-                            duplicate_line_count += 1
-                        else:
-                            loaded_lines.append(embedded_line)
-                            line_keys.add(line_key)
-                            added_line_count += 1
-
-            for e in loaded_entries:
-                if None not in (e.line_x1, e.line_y1, e.line_x2, e.line_y2):
-                    e.line_x1 = None
-                    e.line_y1 = None
-                    e.line_x2 = None
-                    e.line_y2 = None
-
-            self.entries = loaded_entries
-            self.lines = loaded_lines
-
-            self.selected_entry_index = -1
-            self.selected_line_index = -1
-            self.refresh_annotation_table()
-            self.refresh_review_tables()
-            self.image_label.update()
-
-            self.has_annotation = len(self.entries) > 0
-            self.check_review_enable()
-
-            msg = (
-                f"Annotations added: {added_entry_count}\n"
-                f"Duplicate annotation rows skipped: {duplicate_entry_count}\n"
-                f"Connector lines added: {added_line_count}\n"
-                f"Duplicate connector lines skipped: {duplicate_line_count}\n"
-                f"Total annotations: {len(self.entries)}\n"
-                f"Total connector lines: {len(self.lines)}"
-            )
-            if missing_position_count:
-                msg += f"\n\n{missing_position_count} row(s) had blank position values and were placed at default locations. You can drag them after loading."
-            QtWidgets.QMessageBox.information(self, "Load Annotation CSV", msg)
-
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Load Annotation CSV", f"Failed to load annotation CSV:\n{e}")
-
-    def export_bookmarks_csv(self, out_path=None, show_message=True, page_offset=0, create_blank_if_none=True):
-        # PyQt clicked(bool) can accidentally pass False into out_path when connected directly.
-        # Treat boolean values as no path so the Save As dialog opens normally.
-        if isinstance(out_path, bool):
-            out_path = None
-
-        if not self.bookmarks and not create_blank_if_none:
-            if show_message:
-                QtWidgets.QMessageBox.information(self, "Export Bookmark CSV", "No bookmarks available to export.")
-            return False
-
-        if out_path is None:
-            default_path = os.path.join(
-                os.path.dirname(self.open_pdf_path) if self.open_pdf_path else PROJECT_DIR,
-                "bookmark_entries.csv"
-            )
-            out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
-                self, "Export Bookmark CSV", default_path, "CSV Files (*.csv)"
-            )
-            if not out_path:
-                return False
-
-        try:
-            with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.DictWriter(f, fieldnames=BOOKMARK_CSV_COLUMNS)
-                writer.writeheader()
-                for b in self.bookmarks:
-                    writer.writerow({
-                        "TITLE": b.title,
-                        "LEVEL": b.level,
-                        "PAGENO": int(b.pageno) + int(page_offset),
-                    })
-            if show_message:
-                QtWidgets.QMessageBox.information(self, "Export Bookmark CSV", f"Bookmark CSV exported successfully:\n{out_path}")
-            return True
-        except Exception as e:
-            if show_message:
-                QtWidgets.QMessageBox.critical(self, "Export Bookmark CSV", f"Failed to export bookmark CSV:\n{e}")
-            raise
-
-    def load_bookmarks_csv(self):
-        if not self.doc:
-            QtWidgets.QMessageBox.warning(self, "Load Bookmark CSV", "Please open the source PDF first.")
-            return
-
-        in_path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Load Bookmark CSV", "", "CSV Files (*.csv)"
-        )
-        if not in_path:
-            return
-
-        try:
-            existing_bookmarks = list(self.bookmarks)
-            loaded_bookmarks = list(existing_bookmarks)
-            added_bookmark_count = 0
-
-            # IMPORTANT:
-            # Do not de-duplicate bookmarks during CSV import.
-            # A CRF can validly have repeated bookmark titles such as "Visit Date"
-            # under multiple parent visits/forms on the same page and at the same level.
-            # Earlier logic used TITLE + LEVEL + PAGENO as a duplicate key, which removed
-            # valid repeated child bookmarks. Preserve all CSV rows in their import order.
-
-            with open(in_path, "r", newline="", encoding="utf-8-sig") as f:
-                reader = csv.DictReader(f)
-                expected = set(BOOKMARK_CSV_COLUMNS)
-                actual = set([c.strip().upper() for c in (reader.fieldnames or [])])
-
-                if not expected.issubset(actual):
-                    raise ValueError(
-                        "Bookmark CSV is missing required columns.\n"
-                        f"Required: {', '.join(BOOKMARK_CSV_COLUMNS)}"
-                    )
-
-                for row in reader:
-                    title = (row.get("TITLE") or "").strip()
-                    if not title:
-                        continue
-                    level = int(clean_number(row.get("LEVEL"), 1) or 1)
-                    pageno = int(clean_number(row.get("PAGENO"), 1) or 1)
-
-                    new_bookmark = BookmarkEntry(
-                        title=title,
-                        level=level,
-                        pageno=pageno
-                    )
-                    loaded_bookmarks.append(new_bookmark)
-                    added_bookmark_count += 1
-
-            self.bookmarks = loaded_bookmarks
-            self.selected_bookmark_index = -1
-            self.refresh_bookmark_table()
-            self.refresh_review_tables()
-            self.image_label.update()
-
-            self.has_bookmark = len(self.bookmarks) > 0
-            self.check_review_enable()
-
-            QtWidgets.QMessageBox.information(
-                self,
-                "Load Bookmark CSV",
-                f"Bookmarks added: {added_bookmark_count}\n"
-                f"Duplicate bookmark rows skipped: 0\n"
-                f"Total bookmarks: {len(self.bookmarks)}"
-            )
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Load Bookmark CSV", f"Failed to load bookmark CSV:\n{e}")
-
-    def export_variables_csv(self, out_path=None, show_message=True, page_offset=0, create_blank_if_none=True):
+    def _build_variable_export_rows(self, page_offset=0):
         variable_rows = OrderedDict()
 
         for e in self.entries:
@@ -4420,13 +4056,9 @@ class AnnotatorApp(QtWidgets.QWidget):
 
             if not domain or not name:
                 continue
-            if domain.strip().upper() == "REF" and name.strip().upper() == "REF":
+            if domain.upper() == "REF" and name.upper() == "REF":
                 continue
-            if e.is_domain_annotation:
-                continue
-            if e.is_assigned_field:
-                continue
-            if e.is_not_submitted:
+            if e.is_domain_annotation or e.is_assigned_field or e.is_not_submitted:
                 continue
 
             key = (domain.upper(), name.upper())
@@ -4434,44 +4066,281 @@ class AnnotatorApp(QtWidgets.QWidget):
                 variable_rows[key] = {
                     "DOMAIN": domain,
                     "VARIABLE": name,
-                    "pages": set()
+                    "pages": set(),
                 }
             variable_rows[key]["pages"].add(int(e.pageno) + int(page_offset))
 
-        if not variable_rows and not create_blank_if_none:
+        rows = []
+        for item in variable_rows.values():
+            rows.append([
+                item["DOMAIN"],
+                item["VARIABLE"],
+                ",".join(str(p) for p in sorted(item["pages"])),
+            ])
+        return rows
+
+    @staticmethod
+    def _format_excel_sheet(ws, widths=None):
+        header_fill = PatternFill("solid", fgColor="D9EAF7")
+        header_font = Font(bold=True)
+
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+        if widths:
+            for idx, width in enumerate(widths, start=1):
+                ws.column_dimensions[get_column_letter(idx)].width = width
+
+    def import_project_excel(self):
+        """Import a complete AnnotateCRF Excel workbook into the current PDF project."""
+        if not self.doc:
+            QtWidgets.QMessageBox.warning(self, "Import Excel", "Please open the source PDF before importing Excel data.")
+            return
+
+        start_dir = os.path.dirname(self.open_pdf_path) if self.open_pdf_path else PROJECT_DIR
+        in_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Import AnnotateCRF Excel", start_dir, "Excel Workbook (*.xlsx)"
+        )
+        if not in_path:
+            return
+
+        choice = QtWidgets.QMessageBox(self)
+        choice.setWindowTitle("Import Excel")
+        choice.setText("How should the Excel data be imported?")
+        replace_btn = choice.addButton("Load / Replace", QtWidgets.QMessageBox.AcceptRole)
+        append_btn = choice.addButton("Append", QtWidgets.QMessageBox.ActionRole)
+        choice.addButton(QtWidgets.QMessageBox.Cancel)
+        choice.exec_()
+        clicked = choice.clickedButton()
+        if clicked not in (replace_btn, append_btn):
+            return
+        append_mode = clicked is append_btn
+
+        try:
+            wb = load_workbook(in_path, data_only=True)
+            required = {"Annotations", "Bookmarks", "Connector Lines"}
+            missing = required.difference(wb.sheetnames)
+            if missing:
+                raise ValueError("Missing required worksheet(s): " + ", ".join(sorted(missing)))
+
+            def sheet_records(ws):
+                rows = list(ws.iter_rows(values_only=True))
+                if not rows:
+                    return []
+                headers = [str(v or "").strip().upper() for v in rows[0]]
+                return [dict(zip(headers, row)) for row in rows[1:] if any(v is not None and str(v).strip() != "" for v in row)]
+
+            imported_entries = []
+            for rec in sheet_records(wb["Annotations"]):
+                domain = str(rec.get("DOMAIN") or "").strip()
+                name = str(rec.get("NAME") or "").strip()
+                annotation = str(rec.get("ANNOTATION") or "").strip()
+                assignedfield = str(rec.get("ASSIGNEDFIELD") or "").strip()
+                pageno = int(clean_number(rec.get("PAGENO"), 0) or 0)
+                if pageno < 1 or pageno > len(self.doc):
+                    continue
+
+                page_rect = self.get_pdf_page_rect(pageno)
+                default_x, default_y, default_pageh = self.get_default_annotation_position(
+                    pageno, (self.entries + imported_entries) if append_mode else imported_entries
+                )
+                x1 = clean_number(rec.get("X1"), default_x)
+                y1 = clean_number(rec.get("Y1"), default_y)
+                pageh = clean_number(rec.get("PAGEH"), default_pageh)
+                box_w = clean_number(rec.get("BOX_W"), None)
+                box_h = clean_number(rec.get("BOX_H"), None)
+                is_domain, is_assigned, is_notsub = bool_from_entry(domain, name, annotation, assignedfield)
+
+                imported_entries.append(AnnotationEntry(
+                    domain=domain, name=name, pageno=pageno, annotation=annotation,
+                    assignedfield=assignedfield, x1=float(x1), y1=float(y1), pageh=float(pageh),
+                    is_domain_annotation=is_domain, is_assigned_field=is_assigned,
+                    is_not_submitted=is_notsub,
+                    box_w=None if box_w is None else float(box_w),
+                    box_h=None if box_h is None else float(box_h),
+                ))
+
+            imported_bookmarks = []
+            for rec in sheet_records(wb["Bookmarks"]):
+                title = str(rec.get("TITLE") or "").strip()
+                level = int(clean_number(rec.get("LEVEL"), 1) or 1)
+                pageno = int(clean_number(rec.get("PAGENO"), 0) or 0)
+                if title and 1 <= pageno <= len(self.doc):
+                    imported_bookmarks.append(BookmarkEntry(title=title, level=max(1, level), pageno=pageno))
+
+            imported_lines = []
+            for rec in sheet_records(wb["Connector Lines"]):
+                pageno = int(clean_number(rec.get("PAGENO"), 0) or 0)
+                if not (1 <= pageno <= len(self.doc)):
+                    continue
+                coords = [clean_number(rec.get(k), None) for k in ("X1", "Y1", "X2", "Y2")]
+                if any(v is None for v in coords):
+                    continue
+                imported_lines.append(ConnectorLineEntry(
+                    pageno=pageno, x1=float(coords[0]), y1=float(coords[1]),
+                    x2=float(coords[2]), y2=float(coords[3])
+                ))
+
+            if append_mode:
+                ann_keys = {annotation_entry_key(e) for e in self.entries}
+                bm_keys = {bookmark_entry_key(b) for b in self.bookmarks}
+                line_keys = {connector_line_key(ln) for ln in self.lines}
+                added_ann = [e for e in imported_entries if annotation_entry_key(e) not in ann_keys]
+                added_bm = [b for b in imported_bookmarks if bookmark_entry_key(b) not in bm_keys]
+                added_lines = [ln for ln in imported_lines if connector_line_key(ln) not in line_keys]
+                self.entries.extend(added_ann)
+                self.bookmarks.extend(added_bm)
+                self.lines.extend(added_lines)
+            else:
+                self.entries = imported_entries
+                self.bookmarks = imported_bookmarks
+                self.lines = imported_lines
+                added_ann, added_bm, added_lines = imported_entries, imported_bookmarks, imported_lines
+
+            self.has_annotation = bool(self.entries)
+            self.has_bookmark = bool(self.bookmarks)
+            self.selected_entry_index = -1
+            self.selected_bookmark_index = -1
+            self.selected_line_index = -1
+            self.refresh_annotation_table()
+            self.refresh_bookmark_table()
+            self.refresh_review_tables()
+            self.check_review_enable()
+            self.update_annotation_action_buttons()
+            self.render_page()
+
+            QtWidgets.QMessageBox.information(
+                self, "Import Excel",
+                f"Excel workbook imported successfully.\n\n"
+                f"Annotations added: {len(added_ann)}\n"
+                f"Bookmarks added: {len(added_bm)}\n"
+                f"Connector Lines added: {len(added_lines)}"
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Import Excel", f"Failed to import Excel workbook:\n{e}")
+
+    def export_project_excel(self, out_path=None, show_message=True, page_offset=0, create_blank_if_none=True):
+        """Export the complete current annotation project to one Excel workbook.
+
+        The same export is used from both the Annotation and Bookmark pages and always
+        contains the current Annotations, Bookmarks, Connector Lines, and Variables.
+        """
+        if isinstance(out_path, bool):
+            out_path = None
+
+        if not self.entries and not self.bookmarks and not self.lines and not create_blank_if_none:
             if show_message:
-                QtWidgets.QMessageBox.information(self, "Export Variables CSV", "No variable annotations available to export.")
+                QtWidgets.QMessageBox.information(self, "Export Excel", "No annotation data available to export.")
             return False
 
         if out_path is None:
-            default_path = os.path.join(
-                os.path.dirname(self.open_pdf_path) if self.open_pdf_path else PROJECT_DIR,
-                "variables.csv"
-            )
+            if self.open_pdf_path:
+                pdf_stem = os.path.splitext(os.path.basename(self.open_pdf_path))[0]
+                default_name = f"{pdf_stem}_annotatecrf.xlsx"
+                default_dir = os.path.dirname(self.open_pdf_path)
+            else:
+                default_name = "annotatecrf_workbook.xlsx"
+                default_dir = PROJECT_DIR
+
+            default_path = os.path.join(default_dir, default_name)
             out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
-                self, "Export Variables CSV", default_path, "CSV Files (*.csv)"
+                self,
+                "Export AnnotateCRF Excel",
+                default_path,
+                "Excel Workbook (*.xlsx)",
             )
             if not out_path:
                 return False
 
+        out_path = ensure_xlsx_extension(out_path)
+
         try:
-            with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.DictWriter(f, fieldnames=["DOMAIN", "VARIABLE", "PAGES"])
-                writer.writeheader()
-                for _, item in variable_rows.items():
-                    pages = sorted(item["pages"])
-                    writer.writerow({
-                        "DOMAIN": item["DOMAIN"],
-                        "VARIABLE": item["VARIABLE"],
-                        "PAGES": ",".join(str(p) for p in pages)
-                    })
+            _ensure_console_safe_streams()
+
+            wb = Workbook()
+            ws_ann = wb.active
+            ws_ann.title = "Annotations"
+            ws_bm = wb.create_sheet("Bookmarks")
+            ws_lines = wb.create_sheet("Connector Lines")
+            ws_vars = wb.create_sheet("Variables")
+
+            ws_ann.append(ANNOTATION_EXCEL_COLUMNS)
+            for e in self.entries:
+                ws_ann.append([
+                    e.domain,
+                    e.name,
+                    int(e.pageno) + int(page_offset),
+                    adjust_page_refs_in_text(e.annotation, page_offset),
+                    e.assignedfield,
+                    e.x1,
+                    e.y1,
+                    e.pageh,
+                    None if e.box_w is None else e.box_w,
+                    None if e.box_h is None else e.box_h,
+                ])
+
+            ws_bm.append(BOOKMARK_EXCEL_COLUMNS)
+            for b in self.bookmarks:
+                ws_bm.append([
+                    b.title,
+                    b.level,
+                    int(b.pageno) + int(page_offset),
+                ])
+
+            ws_lines.append(CONNECTOR_LINE_EXCEL_COLUMNS)
+            for ln in self.lines:
+                ws_lines.append([
+                    int(ln.pageno) + int(page_offset),
+                    ln.x1,
+                    ln.y1,
+                    ln.x2,
+                    ln.y2,
+                ])
+
+            ws_vars.append(VARIABLE_EXCEL_COLUMNS)
+            for row in self._build_variable_export_rows(page_offset=page_offset):
+                ws_vars.append(row)
+
+            self._format_excel_sheet(ws_ann, [14, 18, 10, 48, 16, 12, 12, 12, 12, 12])
+            self._format_excel_sheet(ws_bm, [50, 10, 10])
+            self._format_excel_sheet(ws_lines, [10, 14, 14, 14, 14])
+            self._format_excel_sheet(ws_vars, [14, 20, 30])
+
+            atomic_excel_write(out_path, wb)
+
             if show_message:
-                QtWidgets.QMessageBox.information(self, "Export Variables CSV", f"Variables CSV exported successfully:\n{out_path}")
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Export Excel",
+                    "Excel workbook exported successfully:\n"
+                    f"{out_path}\n\n"
+                    f"Annotations: {len(self.entries)}\n"
+                    f"Bookmarks: {len(self.bookmarks)}\n"
+                    f"Connector Lines: {len(self.lines)}\n"
+                    f"Variables: {len(self._build_variable_export_rows(page_offset=page_offset))}",
+                )
             return True
+
         except Exception as e:
             if show_message:
-                QtWidgets.QMessageBox.critical(self, "Export Variables CSV", f"Failed to export variables CSV:\n{e}")
-            raise
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Export Excel",
+                    "Failed to export Excel workbook:\n"
+                    f"{e}\n\n"
+                    "Please check that the workbook is not already open in another application "
+                    "and that the selected folder is writable.",
+                )
+            return False
 
     # ------------------------------------------------------------------
     # Final PDF generation
@@ -4505,9 +4374,7 @@ class AnnotatorApp(QtWidgets.QWidget):
             doc = fitz.open(self.open_pdf_path)
 
             pdf_base = get_pdf_base_output_path(output_pdf)
-            annotation_csv_path = pdf_base + "_annotation.csv"
-            bookmark_csv_path = pdf_base + "_bookmarks.csv"
-            variables_csv_path = pdf_base + "_variables.csv"
+            excel_workbook_path = pdf_base + "_annotatecrf.xlsx"
 
             add_toc_checked = bool(self.chk_add_toc.isChecked() and self.bookmarks)
             toc_page_offset = 0
@@ -4562,7 +4429,7 @@ class AnnotatorApp(QtWidgets.QWidget):
                             output_base_h
                         )
 
-                        # Coordinates are the GUI/visible coordinates already saved in CSV.
+                        # Coordinates are the GUI/visible coordinates stored in the project data.
                         rect = fitz.Rect(
                             float(e.x1),
                             float(e.y1),
@@ -4664,21 +4531,9 @@ class AnnotatorApp(QtWidgets.QWidget):
                 doc.close()
                 doc = None
 
-            # Always create all 3 CSV files so they match the actual final PDF.
-            self.export_annotations_csv(
-                annotation_csv_path,
-                show_message=False,
-                page_offset=toc_page_offset,
-                create_blank_if_none=True
-            )
-            self.export_bookmarks_csv(
-                bookmark_csv_path,
-                show_message=False,
-                page_offset=toc_page_offset,
-                create_blank_if_none=True
-            )
-            self.export_variables_csv(
-                variables_csv_path,
+            # Create one Excel workbook matching the page numbering of the final PDF.
+            self.export_project_excel(
+                excel_workbook_path,
                 show_message=False,
                 page_offset=toc_page_offset,
                 create_blank_if_none=True
@@ -4689,7 +4544,9 @@ class AnnotatorApp(QtWidgets.QWidget):
                 what_written.append(f"{len(self.entries)} annotation(s)")
             if self.bookmarks:
                 what_written.append(f"{len(self.bookmarks)} bookmark(s)")
-            what_written.append("3 CSV file(s)")
+            if self.lines:
+                what_written.append(f"{len(self.lines)} connector line(s)")
+            what_written.append("1 Excel workbook")
             if toc_added:
                 what_written.append("TOC with hyperlinks")
 
