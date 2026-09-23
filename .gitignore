@@ -1,0 +1,7 @@
+/CDISC_API_KEY.json
+# Python cache
+__pycache__/
+*.py[cod]
+# macOS
+.DS_Store
+
