@@ -17,6 +17,7 @@ AnnotateCRF Studio supports:
 - Multi-user annotation and review workflows
 - Clickable internal page-reference links
 - CDISC Library API integration
+- Configurable annotation font sizes with default 10 pt / 12 pt behavior
 - Final annotated PDF generation
 
 ---
@@ -469,6 +470,30 @@ The available spreadsheet applications depend on the operating system and user e
 
 ---
 
+## Annotation Font Size Settings
+
+AnnotateCRF Studio provides document-wide font-size controls for annotation output.
+
+By default, the application uses:
+
+```text
+Standard annotation font: 10 pt
+Domain annotation font:   12 pt
+```
+
+The **Use default font sizes (10 / 12)** option is enabled by default. While it is enabled, the custom font-size controls remain hidden and the standard 10 pt / 12 pt settings are used.
+
+When the default option is cleared, separate controls are displayed for:
+
+- Standard annotation font size
+- Domain annotation font size
+
+Each font size can be selected independently from **8 pt through 14 pt**. This allows the annotation and domain font sizes to be adjusted separately when a CRF layout requires smaller or larger annotation text.
+
+The selected font sizes are applied consistently to annotation display, text wrapping, annotation box sizing, and final PDF generation.
+
+---
+
 ## Color and Display Behavior
 
 AnnotateCRF Studio applies visual formatting to make annotations easier to identify and review.
@@ -481,6 +506,8 @@ Features include:
 - Dedicated highlighting for Not Submitted annotations
 - Automatic text wrapping
 - Automatic annotation box sizing
+- Default annotation/domain font sizes of 10 pt / 12 pt
+- Optional independent annotation and domain font-size controls from 8 pt to 14 pt
 - Handling of both single-line and multi-line annotations
 
 ---
@@ -664,6 +691,19 @@ Also confirm that the required application files are present and that the user h
 
 ---
 
+## Change History
+
+### September 2026
+
+- Added configurable annotation font-size controls.
+- Default font sizes remain **10 pt for standard annotations** and **12 pt for domain annotations**.
+- Added a **Use default font sizes (10 / 12)** option that keeps the custom font controls hidden during normal use.
+- When the default option is cleared, separate **Annotation Font** and **Domain Font** controls are displayed.
+- Custom annotation and domain font sizes can be selected independently from **8 pt to 14 pt**.
+- Font-size selections are applied consistently to annotation layout, wrapping, preview, and final PDF generation.
+
+---
+
 ## Development
 
 The main application source is:
@@ -739,5 +779,6 @@ Key capabilities include:
 - Excel import and export
 - Multi-user annotation workflows
 - CDISC Library API integration
+- Configurable annotation and domain font sizes
 - Final annotated PDF generation
 - Windows, macOS, and Linux support
