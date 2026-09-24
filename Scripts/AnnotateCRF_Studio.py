@@ -2454,7 +2454,7 @@ class AnnotatorApp(QtWidgets.QWidget):
         layout.addWidget(header)
 
         contact_note = QtWidgets.QLabel(
-            "For queries / suggestions / issues: Manivannan.Mathialagan@veristat.com"
+            "For queries / suggestions / issues: Manivannan.Mathi@outlook.com"
         )
         contact_note.setAlignment(QtCore.Qt.AlignCenter)
         contact_note.setWordWrap(True)
