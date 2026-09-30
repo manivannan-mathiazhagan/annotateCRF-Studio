@@ -103,7 +103,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
 QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
 
-import fitz
+import pymupdf as fitz
 import requests
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
