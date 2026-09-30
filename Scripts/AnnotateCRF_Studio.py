@@ -38,7 +38,16 @@
 #                  • CDISC Library API
 #
 # Developed By   : Manivannan Mathialagan
-# Last Updated   : August 2026
+# Last Updated   : September 2026
+#
+# Change History  :
+#                  • Sep 2026 - Added document-wide annotation font controls.
+#                    Default mode uses 10 pt normal annotations and 12 pt domain annotations.
+#                    Unchecking "Use default font sizes (10 / 12)" reveals independent
+#                    Annotation Font and Domain Font dropdowns (8-14 pt).
+#                    Custom selections are preserved when default mode is toggled back on/off.
+#                    Preview, hit-testing, wrapping, box sizing, and final PDF generation all
+#                    use the active font settings consistently.
 #
 # ====================================================================================================
 
@@ -153,8 +162,9 @@ BORDER_COLOR = (0.0, 0.0, 0.0)
 FONT_NORMAL = "helv"
 FONT_BOLD = "hebo"
 
-BASE_FONT_SIZE = 10
-DOMAIN_FONT_SIZE = 12
+DEFAULT_BASE_FONT_SIZE = 10
+DEFAULT_DOMAIN_FONT_SIZE = 12
+FONT_SIZE_OPTIONS = list(range(8, 15))
 
 TEXT_PADDING_X = 3.0
 TEXT_PADDING_Y = 1.5
@@ -653,7 +663,7 @@ def get_page_domain_color_map(entries, pageno: int) -> dict:
     return color_map
 
 
-def compute_entry_layout(entry, color_map, page_width=None):
+def compute_entry_layout(entry, color_map, page_width=None, base_font_size=DEFAULT_BASE_FONT_SIZE, domain_font_size=DEFAULT_DOMAIN_FONT_SIZE):
     domain_key = (entry.domain or "").strip().upper()
 
     if entry.is_not_submitted:
@@ -666,8 +676,8 @@ def compute_entry_layout(entry, color_map, page_width=None):
         fill = color_map.get(domain_key, MSG_BLUE_FILL)
     dashed = bool(entry.is_assigned_field)
     bold = bool(entry.is_domain_annotation)
-    font_size = DOMAIN_FONT_SIZE if bold else BASE_FONT_SIZE
-    scale = DOMAIN_FONT_SIZE / BASE_FONT_SIZE if bold else 1.0
+    font_size = domain_font_size if bold else base_font_size
+    scale = domain_font_size / base_font_size if bold else 1.0
     base_h = BOX_HEIGHT_DOMAIN if bold else BOX_HEIGHT_NORMAL
 
     text = (entry.annotation or "").replace("	", "    ").rstrip()
@@ -2024,7 +2034,7 @@ class PdfLabel(QtWidgets.QLabel):
 
     def _get_entry_rect_on_screen(self, entry, color_map):
         page_width = self.main_window.page_rect.width if self.main_window.page_rect else None
-        layout = compute_entry_layout(entry, color_map, page_width=page_width)
+        layout = compute_entry_layout(entry, color_map, page_width=page_width, base_font_size=self.main_window.base_font_size, domain_font_size=self.main_window.domain_font_size)
         rect_pdf = rect_from_top_origin(entry.x1, entry.y1, layout["box_w"], layout["box_h"], entry.pageh)
         zoom = self.main_window.zoom
         return QtCore.QRectF(rect_pdf.x0 * zoom, rect_pdf.y0 * zoom, rect_pdf.width * zoom, rect_pdf.height * zoom)
@@ -2256,7 +2266,7 @@ class PdfLabel(QtWidgets.QLabel):
             if entry.pageno != current_page:
                 continue
 
-            layout = compute_entry_layout(entry, color_map, page_width=page_width)
+            layout = compute_entry_layout(entry, color_map, page_width=page_width, base_font_size=self.main_window.base_font_size, domain_font_size=self.main_window.domain_font_size)
             rect_pdf = rect_from_top_origin(entry.x1, entry.y1, layout["box_w"], layout["box_h"], entry.pageh)
             rect = QtCore.QRectF(rect_pdf.x0 * zoom, rect_pdf.y0 * zoom, rect_pdf.width * zoom, rect_pdf.height * zoom)
 
@@ -2405,6 +2415,11 @@ class AnnotatorApp(QtWidgets.QWidget):
         self.sdtm_variables_by_domain = {}
         self.sdtm_metadata_loaded = False
 
+        # Document-wide annotation font settings. Default mode preserves the
+        # original 10 pt normal / 12 pt domain annotation appearance.
+        self.base_font_size = DEFAULT_BASE_FONT_SIZE
+        self.domain_font_size = DEFAULT_DOMAIN_FONT_SIZE
+
         self.build_ui()
 
     def apply_app_icon(self):
@@ -2439,7 +2454,7 @@ class AnnotatorApp(QtWidgets.QWidget):
         layout.addWidget(header)
 
         contact_note = QtWidgets.QLabel(
-            "For queries / suggestions / issues: Manivannan.Mathialagan@veristat.com"
+            "For queries / suggestions / issues: Manivannan.Mathi@outlook.com"
         )
         contact_note.setAlignment(QtCore.Qt.AlignCenter)
         contact_note.setWordWrap(True)
@@ -2657,6 +2672,49 @@ class AnnotatorApp(QtWidgets.QWidget):
         mode_row.addWidget(self.btn_bookmark, 1)
         mode_row.addWidget(self.btn_review, 1)
         layout.addLayout(mode_row)
+
+        # Font settings: keep the standard/default view compact. Custom controls
+        # appear only when the user chooses to override the default 10 / 12 sizes.
+        font_settings_row = QtWidgets.QHBoxLayout()
+        font_settings_row.setSpacing(10)
+
+        self.chk_default_font_sizes = QtWidgets.QCheckBox(
+            f"Use default font sizes ({DEFAULT_BASE_FONT_SIZE} / {DEFAULT_DOMAIN_FONT_SIZE})"
+        )
+        self.chk_default_font_sizes.setChecked(True)
+        self.chk_default_font_sizes.setToolTip(
+            "Checked: normal annotations use 10 pt and domain annotations use 12 pt. "
+            "Uncheck to select both sizes independently."
+        )
+        self.chk_default_font_sizes.setStyleSheet(
+            "QCheckBox { font-family: 'Times New Roman'; font-size: 11pt; "
+            "color: #27496d; padding: 4px 2px; }"
+        )
+
+        self.font_controls_widget = QtWidgets.QWidget()
+        custom_font_layout = QtWidgets.QHBoxLayout(self.font_controls_widget)
+        custom_font_layout.setContentsMargins(0, 0, 0, 0)
+        custom_font_layout.setSpacing(8)
+
+        custom_font_layout.addWidget(QtWidgets.QLabel("Annotation Font:"))
+        self.cmb_base_font = QtWidgets.QComboBox()
+        self.cmb_base_font.addItems([str(v) for v in FONT_SIZE_OPTIONS])
+        self.cmb_base_font.setCurrentText(str(DEFAULT_BASE_FONT_SIZE))
+        self.cmb_base_font.setFixedWidth(72)
+        custom_font_layout.addWidget(self.cmb_base_font)
+
+        custom_font_layout.addWidget(QtWidgets.QLabel("Domain Font:"))
+        self.cmb_domain_font = QtWidgets.QComboBox()
+        self.cmb_domain_font.addItems([str(v) for v in FONT_SIZE_OPTIONS])
+        self.cmb_domain_font.setCurrentText(str(DEFAULT_DOMAIN_FONT_SIZE))
+        self.cmb_domain_font.setFixedWidth(72)
+        custom_font_layout.addWidget(self.cmb_domain_font)
+
+        self.font_controls_widget.setVisible(False)
+        font_settings_row.addWidget(self.chk_default_font_sizes)
+        font_settings_row.addWidget(self.font_controls_widget)
+        font_settings_row.addStretch()
+        layout.addLayout(font_settings_row)
 
         # Main stack:
         # 0 = normal view (PDF + mode tools below)
@@ -2930,6 +2988,10 @@ class AnnotatorApp(QtWidgets.QWidget):
 
         self.btn_generate_pdf.clicked.connect(self.generate_final_output_pdf)
 
+        self.chk_default_font_sizes.toggled.connect(self.on_default_font_sizes_toggled)
+        self.cmb_base_font.currentTextChanged.connect(self.on_custom_font_size_changed)
+        self.cmb_domain_font.currentTextChanged.connect(self.on_custom_font_size_changed)
+
         self.annotation_table.itemSelectionChanged.connect(self.on_annotation_selection_changed)
         self.bookmark_table.itemSelectionChanged.connect(self.on_bookmark_selection_changed)
 
@@ -2949,6 +3011,32 @@ class AnnotatorApp(QtWidgets.QWidget):
 
         self.switch_mode("annotation", force=True)
         self.update_annotation_action_buttons()
+
+    def on_default_font_sizes_toggled(self, checked):
+        """Switch between the original default font sizes and custom document-wide sizes."""
+        self.font_controls_widget.setVisible(not checked)
+
+        if checked:
+            self.base_font_size = DEFAULT_BASE_FONT_SIZE
+            self.domain_font_size = DEFAULT_DOMAIN_FONT_SIZE
+        else:
+            self.base_font_size = int(self.cmb_base_font.currentText())
+            self.domain_font_size = int(self.cmb_domain_font.currentText())
+
+        # Repaint immediately so annotation boxes, wrapping and text reflect the active sizes.
+        if hasattr(self, "image_label"):
+            self.image_label.update()
+
+    def on_custom_font_size_changed(self, _value=None):
+        """Apply custom font sizes only while default-font mode is disabled."""
+        if self.chk_default_font_sizes.isChecked():
+            return
+
+        self.base_font_size = int(self.cmb_base_font.currentText())
+        self.domain_font_size = int(self.cmb_domain_font.currentText())
+
+        if hasattr(self, "image_label"):
+            self.image_label.update()
 
     def init_splitter_sizes(self):
         total = max(self.height() - 200, 700)
@@ -4410,14 +4498,14 @@ class AnnotatorApp(QtWidgets.QWidget):
                     color_map = get_page_domain_color_map(self.entries, page_no)
 
                     for e in page_entries:
-                        layout = compute_entry_layout(e, color_map, page_width=visible_width)
+                        layout = compute_entry_layout(e, color_map, page_width=visible_width, base_font_size=self.base_font_size, domain_font_size=self.domain_font_size)
 
                         annotation_text_for_output = adjust_page_refs_in_text(e.annotation, toc_page_offset)
                         layout_for_output = dict(layout)
                         layout_for_output["lines"] = wrap_text_by_width(
                             annotation_text_for_output,
                             layout["box_w"],
-                            scale=(DOMAIN_FONT_SIZE / BASE_FONT_SIZE if layout["bold"] else 1.0)
+                            scale=(self.domain_font_size / self.base_font_size if layout["bold"] else 1.0)
                         )
 
                         output_base_h = BOX_HEIGHT_DOMAIN if layout["bold"] else BOX_HEIGHT_NORMAL
